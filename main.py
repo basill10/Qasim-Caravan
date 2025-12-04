@@ -305,43 +305,101 @@ def _extract_text_from_responses(resp: Any) -> str:
     """
     Robustly extract assistant text from a Responses API result.
 
-    Supports the new `resp.output[...].content[...].text` shape and
-    falls back to older/layout-agnostic attributes.
+    Supports both Pydantic objects (new SDK) and plain dicts.
+    Looks for output_text blocks and pulls their `text.value` or `text`.
     """
-    # Preferred: new Responses API shape
+    # Helper to pull text from a single content item (object or dict)
+    def _content_to_text(c: Any) -> str:
+        # dict shape
+        if isinstance(c, dict):
+            if c.get("type") != "output_text":
+                return ""
+            text_obj = c.get("text")
+            if isinstance(text_obj, dict):
+                # typical: {"value": "...", "annotations": [...]}
+                val = text_obj.get("value")
+                if isinstance(val, str):
+                    return val
+                return str(val) if val is not None else ""
+            if isinstance(text_obj, str):
+                return text_obj
+            return str(text_obj) if text_obj is not None else ""
+
+        # object shape
+        c_type = getattr(c, "type", "")
+        if c_type != "output_text":
+            return ""
+        text_obj = getattr(c, "text", None)
+        # text_obj might itself have .value
+        if hasattr(text_obj, "value"):
+            val = getattr(text_obj, "value")
+            if isinstance(val, str):
+                return val
+            return str(val) if val is not None else ""
+        if isinstance(text_obj, str):
+            return text_obj
+        if text_obj is not None:
+            return str(text_obj)
+        return ""
+
+    # 1) Try direct attr access: resp.output -> out.content -> content.text
     try:
         output = getattr(resp, "output", None)
+        chunks: List[str] = []
         if output:
-            chunks: List[str] = []
             for out in output:
-                content_list = getattr(out, "content", []) or []
+                # handle object vs dict for `out`
+                if hasattr(out, "content"):
+                    content_list = getattr(out, "content") or []
+                elif isinstance(out, dict):
+                    content_list = out.get("content", []) or []
+                else:
+                    content_list = []
                 for c in content_list:
-                    if getattr(c, "type", "") == "output_text":
-                        # In the new SDK, `c.text` is an object that stringifies to the text
-                        try:
-                            chunks.append(str(c.text))
-                        except Exception:
-                            t = getattr(c, "text", None)
-                            if t is not None:
-                                chunks.append(str(getattr(t, "value", t)))
-            text = "\n".join(chunks).strip()
-            if text:
-                return text
+                    txt = _content_to_text(c)
+                    if txt:
+                        chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
     except Exception:
-        # Fall through to legacy heuristics
         pass
 
-    # Legacy / fallback shapes
-    if hasattr(resp, "output_text") and resp.output_text:
-        try:
-            return str(resp.output_text).strip()
-        except Exception:
-            pass
+    # 2) Try model_dump() if available (Pydantic models)
+    try:
+        d = resp.model_dump()  # type: ignore[attr-defined]
+    except Exception:
+        d = resp if isinstance(resp, dict) else None
+
+    if isinstance(d, dict):
+        chunks: List[str] = []
+        output = d.get("output") or []
+        for out in output:
+            content_list = out.get("content", []) or []
+            for c in content_list:
+                txt = _content_to_text(c)
+                if txt:
+                    chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
+
+    # 3) Other fallbacks: output_text, text, content
+    # Some SDK versions expose a simpler aggregate
+    try:
+        ot = getattr(resp, "output_text", None)
+        if ot:
+            return str(ot).strip()
+    except Exception:
+        pass
+
+    t = getattr(resp, "text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
 
     if hasattr(resp, "content") and resp.content:
         return str(resp.content).strip()
 
     return ""
+
 
 
 
