@@ -376,7 +376,7 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
     )
     user_msg = f"Generate {max_ideas} distinct story titles."
 
-    # Try Responses API with web_search tools
+    # Prefer Responses API with web_search tools
     try:
         resp = client.responses.create(
             model=model,
@@ -391,6 +391,7 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
                 "search_context_size": "medium",
             }],
             reasoning={"effort": "low", "summary": "disabled"},
+            max_output_tokens=400,
         )
         content = _extract_text_from_responses(resp)
         data = json.loads(content)
@@ -405,7 +406,8 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.4,
-            max_tokens=400,
+            # NOTE: new param name for modern models:
+            max_completion_tokens=400,
             response_format={"type": "json_object"},
         )
         content = resp.choices[0].message.content
@@ -416,6 +418,7 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
             data = json.loads(m.group(0)) if m else {"ideas": []}
         ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
         return ideas[:max_ideas]
+
 
 
 # -------------------------------
