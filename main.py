@@ -376,48 +376,57 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
     )
     user_msg = f"Generate {max_ideas} distinct story titles."
 
-    # Prefer Responses API with web_search tools
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            text={"format": {"type": "json_object"}, "verbosity": "low"},
-            tools=[{
+    # Single path: Responses API + web_search tool (no non-web fallback)
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        text={
+            "format": {
+                "type": "json_object"
+            },
+            "verbosity": "medium",
+        },
+        reasoning={
+            "effort": "medium",
+            "summary": "auto",
+        },
+        tools=[
+            {
                 "type": "web_search",
-                "user_location": {"type": "approximate"},
+                "user_location": {
+                    "type": "approximate",
+                    "country": "PK",
+                },
                 "search_context_size": "medium",
-            }],
-            reasoning={"effort": "low", "summary": "disabled"},
-            max_output_tokens=400,
-        )
-        content = _extract_text_from_responses(resp)
+            }
+        ],
+        store=True,
+        include=[
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources",
+        ],
+        max_output_tokens=400,
+    )
+
+    content = _extract_text_from_responses(resp)
+    if not content:
+        raise RuntimeError("No content returned when fetching story ideas from web_search.")
+
+    try:
         data = json.loads(content)
-        ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
-        return ideas[:max_ideas] if ideas else []
     except Exception:
-        # Fallback: plain chat completion (no explicit web_search tool)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.4,
-            # NOTE: new param name for modern models:
-            max_completion_tokens=400,
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content
-        try:
-            data = json.loads(content)
-        except Exception:
-            m = re.search(r"\{.*\}", content, re.DOTALL)
-            data = json.loads(m.group(0)) if m else {"ideas": []}
-        ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
-        return ideas[:max_ideas]
+        # Try to salvage JSON if there is surrounding text (shouldn't happen with json_object, but just in case)
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if not m:
+            raise RuntimeError(f"Could not parse JSON from story ideas response: {content!r}")
+        data = json.loads(m.group(0))
+
+    ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
+    return ideas[:max_ideas]
+
 
 
 
