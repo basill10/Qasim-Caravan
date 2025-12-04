@@ -439,22 +439,21 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
     if not content:
         raise RuntimeError("Empty response when fetching story ideas.")
 
-    # Parse JSON
+    # Parse JSON out of the text
     try:
         data = json.loads(content)
     except Exception:
-        # Salvage JSON block if wrapped
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
             raise RuntimeError(f"Could not parse JSON from story ideas: {content!r}")
         data = json.loads(m.group(0))
 
     ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
-
     if not ideas:
         raise RuntimeError(f"No ideas found in parsed result: {data!r}")
 
     return ideas[:max_ideas]
+
 
 
 
