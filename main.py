@@ -437,6 +437,7 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
 
 
 
+
 # -------------------------------
 # Fact checking (optional)
 # -------------------------------
