@@ -363,6 +363,7 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
     Use GPT + web_search to propose concise, reel-ready story ideas
     about current, factual developments in Pakistan.
     """
+
     system_msg = (
         "You are a Pakistan-based news researcher for Instagram reels.\n"
         "You propose concise, reel-worthy story titles about recent, factual developments "
@@ -373,13 +374,12 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
         "- at most 15 words\n"
         "- suitable as a reel topic title (no numbering, no emojis, no hashtags).\n"
         "Return ONLY a single JSON object of the form:\n"
-        '{"ideas": ["...", "..."]}\n"
-        "No extra text, no markdown, no explanations."
+        "    {\"ideas\": [\"...\", \"...\"]}\n"
+        "No extra commentary or formatting."
     )
 
     user_msg = f"Generate {max_ideas} distinct story titles."
 
-    # Single path: Responses API + web_search tool (no non-web fallback)
     resp = client.responses.create(
         model=model,
         input=[
@@ -387,22 +387,14 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
             {"role": "user", "content": user_msg},
         ],
         text={
-            "format": {
-                "type": "text"   # IMPORTANT: not json_object when using web_search
-            },
+            "format": {"type": "text"},  # MUST be text when using web_search
             "verbosity": "medium",
         },
-        reasoning={
-            "effort": "medium",
-            "summary": "auto",
-        },
+        reasoning={"effort": "medium", "summary": "auto"},
         tools=[
             {
                 "type": "web_search",
-                "user_location": {
-                    "type": "approximate",
-                    "country": "PK",
-                },
+                "user_location": {"type": "approximate", "country": "PK"},
                 "search_context_size": "medium",
             }
         ],
@@ -416,23 +408,24 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
 
     content = _extract_text_from_responses(resp)
     if not content:
-        raise RuntimeError("No content returned when fetching story ideas from web_search.")
+        raise RuntimeError("Empty response when fetching story ideas.")
 
-    # Try to parse JSON from the model's text output
+    # Parse JSON
     try:
         data = json.loads(content)
     except Exception:
-        # If the model added any extra text around the JSON, salvage the first {...} block
+        # Salvage JSON block if wrapped
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
-            raise RuntimeError(f"Could not parse JSON from story ideas response: {content!r}")
+            raise RuntimeError(f"Could not parse JSON from story ideas: {content!r}")
         data = json.loads(m.group(0))
 
     ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
-    if not ideas:
-        raise RuntimeError(f"No ideas found in story ideas response: {data!r}")
-    return ideas[:max_ideas]
 
+    if not ideas:
+        raise RuntimeError(f"No ideas found in parsed result: {data!r}")
+
+    return ideas[:max_ideas]
 
 
 
