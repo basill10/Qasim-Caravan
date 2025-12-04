@@ -302,18 +302,47 @@ def retrieve_top_k(topic: str, meta: Dict[str, Any], client: OpenAI, embed_model
 
 
 def _extract_text_from_responses(resp: Any) -> str:
-    if hasattr(resp, "output") and resp.output:
-        out = []
-        for item in resp.output:
-            if getattr(item, "type", "") == "message":
-                for c in getattr(item, "content", []):
+    """
+    Robustly extract assistant text from a Responses API result.
+
+    Supports the new `resp.output[...].content[...].text` shape and
+    falls back to older/layout-agnostic attributes.
+    """
+    # Preferred: new Responses API shape
+    try:
+        output = getattr(resp, "output", None)
+        if output:
+            chunks: List[str] = []
+            for out in output:
+                content_list = getattr(out, "content", []) or []
+                for c in content_list:
                     if getattr(c, "type", "") == "output_text":
-                        out.append(c.text)
-        if out:
-            return "\n".join(out).strip()
+                        # In the new SDK, `c.text` is an object that stringifies to the text
+                        try:
+                            chunks.append(str(c.text))
+                        except Exception:
+                            t = getattr(c, "text", None)
+                            if t is not None:
+                                chunks.append(str(getattr(t, "value", t)))
+            text = "\n".join(chunks).strip()
+            if text:
+                return text
+    except Exception:
+        # Fall through to legacy heuristics
+        pass
+
+    # Legacy / fallback shapes
+    if hasattr(resp, "output_text") and resp.output_text:
+        try:
+            return str(resp.output_text).strip()
+        except Exception:
+            pass
+
     if hasattr(resp, "content") and resp.content:
         return str(resp.content).strip()
+
     return ""
+
 
 
 def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
