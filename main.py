@@ -357,6 +357,67 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         raise RuntimeError("No text content returned by Responses fallback.")
 
 
+# -------- NEW: story ideas from web (Pakistan) --------
+def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -> List[str]:
+    """
+    Use GPT + web_search to propose concise, reel-ready story ideas
+    about current, factual developments in Pakistan.
+    """
+    system_msg = (
+        "You are a Pakistan-based news researcher for Instagram reels.\n"
+        "You propose concise, reel-worthy story titles about recent, factual developments "
+        "in Pakistan's business, tech, culture, or economy that can be reported on.\n"
+        "Each idea should be:\n"
+        "- grounded in real, verifiable events (use web search)\n"
+        "- neutral, factual, non-clickbait\n"
+        "- at most 15 words\n"
+        "- suitable as a reel topic title (no numbering, no emojis, no hashtags).\n"
+        'Return only valid JSON: {"ideas": ["...", "..."]}.'
+    )
+    user_msg = f"Generate {max_ideas} distinct story titles."
+
+    # Try Responses API with web_search tools
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            text={"format": {"type": "json_object"}, "verbosity": "low"},
+            tools=[{
+                "type": "web_search",
+                "user_location": {"type": "approximate"},
+                "search_context_size": "medium",
+            }],
+            reasoning={"effort": "low", "summary": "disabled"},
+        )
+        content = _extract_text_from_responses(resp)
+        data = json.loads(content)
+        ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
+        return ideas[:max_ideas] if ideas else []
+    except Exception:
+        # Fallback: plain chat completion (no explicit web_search tool)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.4,
+            max_tokens=400,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content
+        try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"\{.*\}", content, re.DOTALL)
+            data = json.loads(m.group(0)) if m else {"ideas": []}
+        ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
+        return ideas[:max_ideas]
+
+
 # -------------------------------
 # Fact checking (optional)
 # -------------------------------
@@ -820,49 +881,80 @@ if not st.session_state.get("openai_api_key"):
     st.info("Add your OPENAI_API_KEY in the sidebar to begin.")
 
 # -------------------------------
-# 1) Corpus input
+# 1) Corpus from repo (scripts.txt)
 # -------------------------------
-st.subheader("1) Provide your corpus (style/knowledge source)")
-col1, col2 = st.columns(2)
-with col1:
-    uploaded = st.file_uploader("Upload a .txt corpus (e.g., scripts.txt)", type=["txt", "md"])
-with col2:
-    paste_mode = st.toggle("Or paste corpus text below")
+st.subheader("1) Corpus (loaded from repo)")
 
 raw_text = ""
 source_label = ""
-if uploaded is not None:
-    raw_bytes = uploaded.read()
-    raw_text = raw_bytes.decode("utf-8", errors="ignore")
-    source_label = f"file:{uploaded.name}"
-elif paste_mode:
-    raw_text = st.text_area("Paste your corpus text", height=220)
-    if raw_text:
-        source_label = "pasted:text"
+corpus_path = Path(__file__).parent / "scripts.txt"
 
-if raw_text:
-    file_hash = sha256_bytes(raw_text.encode("utf-8"))
-    st.success(f"Corpus ready • {len(raw_text):,} characters • hash {file_hash[:8]}…")
-    with st.spinner("Building embeddings index (cached by corpus+model)…"):
-        try:
-            meta = build_or_load_index_cached(file_hash=file_hash, embed_model=DEFAULT_EMBED_MODEL, raw_text=raw_text)
-            st.session_state["meta"] = meta
-            st.caption(f"Indexed {len(meta['chunks'])} chunks • model {meta['model']} • built {meta['built_at']}")
-        except Exception as e:
-            st.error(f"Failed to build/load index: {e}")
+if corpus_path.exists():
+    try:
+        raw_text = corpus_path.read_text(encoding="utf-8", errors="ignore")
+        source_label = f"repo:{corpus_path.name}"
+        file_hash = sha256_bytes(raw_text.encode("utf-8"))
+        st.success(
+            f"Loaded corpus from `{corpus_path.name}` • {len(raw_text):,} characters • hash {file_hash[:8]}…"
+        )
+        with st.spinner("Building embeddings index (cached by corpus+model)…"):
+            try:
+                meta = build_or_load_index_cached(file_hash=file_hash, embed_model=embed_model, raw_text=raw_text)
+                st.session_state["meta"] = meta
+                st.caption(
+                    f"Indexed {len(meta['chunks'])} chunks • model {meta['model']} • built {meta['built_at']}"
+                )
+            except Exception as e:
+                st.error(f"Failed to build/load index: {e}")
+    except Exception as e:
+        st.error(f"Error reading scripts.txt from repo: {e}")
 else:
-    st.warning("Upload or paste a corpus to proceed.")
+    st.error("Could not find `scripts.txt` in the app directory. Add it to the repo to proceed.")
 
 # -------------------------------
 # 2) Generate a script
 # -------------------------------
 st.subheader("2) Generate a script")
-topic = st.text_input("Topic", placeholder="e.g., Pakistan's fintech wave in 2025")
-colg = st.columns([1, 1, 2])
+
+topic = st.text_input("Topic", placeholder="e.g., Pakistan's fintech wave in 2025", key="topic_input")
+
+colg = st.columns([1, 1, 2, 2])
 clicked = colg[0].button("Generate", type="primary", use_container_width=True)
 
-# Output containers
+# NEW: button to fetch Pakistan story ideas from web
+suggest_btn = colg[1].button("Find Pakistan story ideas from web", use_container_width=True)
 
+if suggest_btn:
+    if not st.session_state.get("openai_api_key"):
+        st.error("Add your OPENAI_API_KEY in the sidebar to fetch story ideas.")
+    else:
+        try:
+            client = get_openai_client(st.session_state.get("openai_api_key"))
+            with st.spinner("Looking up fresh Pakistan stories…"):
+                ideas = fetch_story_ideas_from_web(client, gen_model, max_ideas=5)
+            if not ideas:
+                st.warning("Could not find story ideas. Try again in a bit.")
+            else:
+                st.session_state["web_story_ideas"] = ideas
+                st.toast("Loaded story ideas from web", icon="📰")
+        except Exception as e:
+            st.error(f"Fetching story ideas failed: {e}")
+
+# Show ideas (if any) and allow user to auto-fill Topic
+if st.session_state.get("web_story_ideas"):
+    with st.expander("Story ideas from Pakistan news", expanded=True):
+        choice = st.radio(
+            "Pick a story idea to auto-fill Topic",
+            st.session_state["web_story_ideas"],
+            key="story_idea_radio",
+        )
+        use_idea = st.button("Use selected idea as Topic", key="use_story_idea_btn")
+        if use_idea and choice:
+            st.session_state["topic_input"] = choice
+            # Rerun so the updated topic shows in the text_input
+            st.experimental_rerun()
+
+# Output containers
 script_box = st.empty()
 facts_expander = st.expander("Fact-check results", expanded=False)
 
@@ -887,7 +979,7 @@ if clicked and topic and st.session_state.get("meta"):
     meta = st.session_state["meta"]
 
     with st.spinner("Retrieving top chunks…"):
-        top = retrieve_top_k(topic, meta, client, DEFAULT_EMBED_MODEL, k=k)
+        top = retrieve_top_k(topic, meta, client, embed_model, k=k)
         retrieved: List[str] = []
         running = 0
         for idx in top:
@@ -961,7 +1053,7 @@ if clicked and topic and st.session_state.get("meta"):
                         decision = {"claim": c, "verdict": "error", "correction": str(e), "confidence": 0.0, "citations": []}
                     decisions.append(decision)
                     cites = ", ".join(decision.get("citations", [])[:2]) or "—"
-                    facts_table_rows.append({"#": i, "Claim": c, "Verdict": decision.get("verdict", ""), "Confidence": f"{decision.get("confidence", 0):.2f}", "Citations": cites})
+                    facts_table_rows.append({"#": i, "Claim": c, "Verdict": decision.get("verdict", ""), "Confidence": f"{decision.get('confidence', 0):.2f}", "Citations": cites})
                     progress.progress(i / len(claims))
                 progress.empty()
 
@@ -1117,7 +1209,7 @@ if clicked and topic and st.session_state.get("meta"):
 elif clicked and not topic:
     st.warning("Enter a topic first.")
 elif clicked and not st.session_state.get("meta"):
-    st.warning("Build an index by providing a corpus first.")
+    st.warning("Corpus index not ready. Ensure `scripts.txt` is present and index built successfully.")
 
 # If user didn't click this run, keep previous results available (so buttons work after rerun)
 if not clicked and st.session_state.get("has_script"):
