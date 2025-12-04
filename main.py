@@ -922,7 +922,7 @@ colg = st.columns([1, 1, 2, 2])
 clicked = colg[0].button("Generate", type="primary", use_container_width=True)
 
 # NEW: button to fetch Pakistan story ideas from web
-suggest_btn = colg[1].button("Find Pakistan story ideas from web", use_container_width=True)
+suggest_btn = colg[1].button("Find ideas", use_container_width=True)
 
 if suggest_btn:
     if not st.session_state.get("openai_api_key"):
