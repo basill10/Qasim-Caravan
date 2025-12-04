@@ -372,8 +372,11 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
         "- neutral, factual, non-clickbait\n"
         "- at most 15 words\n"
         "- suitable as a reel topic title (no numbering, no emojis, no hashtags).\n"
-        'Return only valid JSON: {"ideas": ["...", "..."]}.'
+        "Return ONLY a single JSON object of the form:\n"
+        '{"ideas": ["...", "..."]}\n"
+        "No extra text, no markdown, no explanations."
     )
+
     user_msg = f"Generate {max_ideas} distinct story titles."
 
     # Single path: Responses API + web_search tool (no non-web fallback)
@@ -385,7 +388,7 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
         ],
         text={
             "format": {
-                "type": "json_object"
+                "type": "text"   # IMPORTANT: not json_object when using web_search
             },
             "verbosity": "medium",
         },
@@ -415,17 +418,21 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
     if not content:
         raise RuntimeError("No content returned when fetching story ideas from web_search.")
 
+    # Try to parse JSON from the model's text output
     try:
         data = json.loads(content)
     except Exception:
-        # Try to salvage JSON if there is surrounding text (shouldn't happen with json_object, but just in case)
+        # If the model added any extra text around the JSON, salvage the first {...} block
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
             raise RuntimeError(f"Could not parse JSON from story ideas response: {content!r}")
         data = json.loads(m.group(0))
 
     ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
+    if not ideas:
+        raise RuntimeError(f"No ideas found in story ideas response: {data!r}")
     return ideas[:max_ideas]
+
 
 
 
