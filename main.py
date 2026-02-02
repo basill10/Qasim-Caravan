@@ -191,26 +191,44 @@ VOICEOVER_CLEAN_SYS = (
     "- Remove ALL URLs/domains and any 'Source:' lines.\n"
 )
 
-def make_clean_voiceover_script(client: OpenAI, script_with_sources: str) -> str:
-    if not script_with_sources or not script_with_sources.strip():
-        return ""
+# -------------------------------
+# Reel script editing (o4-mini)
+# -------------------------------
+REEL_EDIT_SYS = (
+    "You are an expert short-form Instagram reel script editor.\n"
+    "You will be given:\n"
+    "1) A script\n"
+    "2) A change request from the user\n"
+    "Rewrite the script to satisfy the request.\n"
+    "Rules:\n"
+    "- Output ONLY the revised script text (no titles, no markdown, no notes).\n"
+    "- Preserve the original structure/cadence unless the request asks otherwise.\n"
+    "- Keep it punchy and roughly the same length unless the request says otherwise.\n"
+    "- Do NOT add a References section or URLs.\n"
+)
 
+def revise_script_o4mini(client: OpenAI, script: str, change_request: str) -> str:
     resp = client.responses.create(
         model="o4-mini",
         input=[
-            {"role": "system", "content": VOICEOVER_CLEAN_SYS},
-            {"role": "user", "content": script_with_sources},
+            {"role": "system", "content": REEL_EDIT_SYS},
+            {
+                "role": "user",
+                "content": (
+                    "SCRIPT:\n"
+                    f"{script}\n\n"
+                    "CHANGE REQUEST:\n"
+                    f"{change_request}\n"
+                ),
+            },
         ],
         text={"format": {"type": "text"}, "verbosity": "medium"},
-        max_output_tokens=700,
+        max_output_tokens=900,
     )
-
     out = _extract_text_from_responses(resp).strip()
     if not out:
-        raise RuntimeError("o4-mini returned empty output while cleaning voiceover script.")
+        raise RuntimeError("No text returned from o4-mini.")
     return out
-
-    
 
 
 
@@ -224,31 +242,6 @@ VOICEOVER_EDIT_SYS = (
     "- Do NOT add sources, URLs, or reference sections.\n"
 )
 
-def apply_voiceover_changes_o4mini(client: OpenAI, voiceover_script: str, change_request: str) -> str:
-    if not change_request.strip():
-        return voiceover_script
-
-    resp = client.responses.create(
-        model="o4-mini",
-        input=[
-            {"role": "system", "content": VOICEOVER_EDIT_SYS},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "voiceover_script": voiceover_script,
-                        "change_request": change_request,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        text={"format": {"type": "text"}, "verbosity": "medium"},
-        max_output_tokens=900,
-    )
-
-    out = _extract_text_from_responses(resp).strip()
-    return out or voiceover_script
 
 
 
@@ -1421,6 +1414,44 @@ if clicked and topic and st.session_state.get("meta"):
         height=320,
         key="generated_script_text",
     )
+    
+    #
+    st.subheader("2b) Revise the generated script")
+
+    edit_request = st.text_area(
+        "Ask for changes",
+        placeholder="e.g., Make it more conversational, cut it to ~160 words, add one line about X, keep Pakistan angle.",
+        key="script_edit_request",
+        height=100,
+    )
+
+    apply_changes = st.button(
+        "Apply changes (o4-mini)",
+        use_container_width=True,
+        disabled=not edit_request.strip(),
+    )
+
+    if apply_changes:
+        if not st.session_state.get("openai_api_key"):
+            st.error("Add your OPENAI_API_KEY in the sidebar to apply changes.")
+        else:
+            try:
+                with st.spinner("Applying changes with o4-mini…"):
+                    revised = revise_script_o4mini(client, current_script_text, edit_request)
+
+                # Update what the user sees + what the app remembers
+                st.session_state["last_script"] = revised
+                st.session_state["generated_script_text"] = revised
+                st.session_state["script_edit_request"] = ""  # optional: clear box
+
+                # edits invalidate downstream assets
+                st.session_state.pop("audio_bytes", None)
+                st.session_state.pop("heygen_video_url", None)
+
+                st.rerun()
+            except Exception as e:
+                st.error(f"Edit failed: {e}")
+
     st.caption("Tip: If Fact Checking + citations is enabled, it may include [n] markers and a References section.")
 
     # Downloads
@@ -1571,6 +1602,43 @@ if not clicked and st.session_state.get("has_script"):
         height=320,
         key="generated_script_text",
     )
+
+    #
+    st.subheader("2b) Revise the generated script")
+
+    edit_request = st.text_area(
+        "Ask for changes",
+        placeholder="e.g., Make it more conversational, cut it to ~160 words, add one line about X.",
+        key="script_edit_request",
+        height=100,
+    )
+
+    apply_changes = st.button(
+        "Apply changes (o4-mini)",
+        use_container_width=True,
+        disabled=not edit_request.strip(),
+    )
+
+    if apply_changes:
+        if not st.session_state.get("openai_api_key"):
+            st.error("Add your OPENAI_API_KEY in the sidebar to apply changes.")
+        else:
+            try:
+                client = get_openai_client(st.session_state.get("openai_api_key"))
+                with st.spinner("Applying changes with o4-mini…"):
+                    revised = revise_script_o4mini(client, current_script_text, edit_request)
+
+                st.session_state["last_script"] = revised
+                st.session_state["generated_script_text"] = revised
+                st.session_state["script_edit_request"] = ""
+
+                st.session_state.pop("audio_bytes", None)
+                st.session_state.pop("heygen_video_url", None)
+
+                st.rerun()
+            except Exception as e:
+                st.error(f"Edit failed: {e}")
+
 
     # Downloads (script + optional fact report)
     download_buttons_area(current_script_text, topic, facts_payload)
