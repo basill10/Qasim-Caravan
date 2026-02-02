@@ -468,33 +468,35 @@ def fetch_pakistan_people_news_from_web(
             "Search the web for recent news on Pakistani YouTubers and Internet personalities.\n"
             "ONLY include positive, educational, inspiring, or uplifting news.\n"
             "Skip scandals/controversy.\n"
-            "Return a JSON object with key 'items' (array of objects) exactly.\n"
-            "Each item must include: name, headline, summary, url, published.\n"
+            "Return ONLY valid JSON (no markdown, no commentary) in EXACTLY this schema:\n"
+            "{\"items\": [{\"name\":\"...\",\"headline\":\"...\",\"summary\":\"...\",\"url\":\"...\",\"published\":\"...\"}]}\n"
         )
         user_msg = (
             f"Find up to {max_items} items from the last {days_back} days (cutoff: {cutoff_str}).\n"
-            f"{'Focus on this name: ' + name_filter if name_filter else ''}"
+            f"{'Focus on this name: ' + name_filter if name_filter else 'No name filter.'}\n"
+            "Prefer reputable sources and official announcements."
         )
     else:
         system_msg = (
             "You are a careful Pakistan business/startup news researcher.\n"
             "Search the web for recent news on Pakistani founders.\n"
-            "Return a JSON object with key 'items' (array of objects) exactly.\n"
-            "Each item must include: name, headline, summary, url, published.\n"
+            "Return ONLY valid JSON (no markdown, no commentary) in EXACTLY this schema:\n"
+            "{\"items\": [{\"name\":\"...\",\"headline\":\"...\",\"summary\":\"...\",\"url\":\"...\",\"published\":\"...\"}]}\n"
         )
         user_msg = (
             f"Find up to {max_items} items from the last {days_back} days (cutoff: {cutoff_str}).\n"
-            f"{'Focus on this name: ' + name_filter if name_filter else ''}"
+            f"{'Focus on this name: ' + name_filter if name_filter else 'No name filter.'}\n"
+            "Prefer credible business/tech sources."
         )
 
-    # ✅ Force strict JSON output from the model
+    # ✅ IMPORTANT: web_search cannot be used with JSON mode, so keep output as TEXT
     resp = client.responses.create(
         model="o4-mini",
         input=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        text={"format": {"type": "json_object"}, "verbosity": "medium"},
+        text={"format": {"type": "text"}, "verbosity": "medium"},
         tools=[
             {
                 "type": "web_search",
@@ -509,34 +511,34 @@ def fetch_pakistan_people_news_from_web(
     if not content:
         return []
 
-    # Parse JSON (now should be valid)
+    # Parse JSON from the returned text
+    data = None
     try:
         data = json.loads(content)
     except Exception:
-        # If anything still slips through, try to extract first JSON object
+        # try to extract the first JSON object from any extra text
         m = re.search(r"\{.*\}", content, re.DOTALL)
-        if not m:
-            return []
-        data = json.loads(m.group(0))
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = None
 
-    # ✅ Tolerate alternate top-level keys just in case
-    items = (
-        data.get("items")
-        or data.get("results")
-        or data.get("data")
-        or []
-    )
+    if not isinstance(data, dict):
+        return []
 
+    items = data.get("items") or []
     out: List[Dict[str, str]] = []
+
     for it in items:
         if not isinstance(it, dict):
             continue
 
         name = str(it.get("name") or "").strip()
-        headline = str(it.get("headline") or it.get("title") or "").strip()
-        summary = str(it.get("summary") or it.get("snippet") or "").strip()
-        url = str(it.get("url") or it.get("link") or "").strip()
-        published = str(it.get("published") or it.get("published_date") or "").strip()
+        headline = str(it.get("headline") or "").strip()
+        summary = str(it.get("summary") or "").strip()
+        url = str(it.get("url") or "").strip()
+        published = str(it.get("published") or "").strip()
 
         if not (name and headline and summary):
             continue
