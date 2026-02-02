@@ -21,7 +21,7 @@ Auth:
     - APP_PASSWORD (in .streamlit/secrets.toml preferred)
 
 Notes:
-- For GPT-5 models ("gpt-5", "gpt-5-pro"), we use the Responses API and NEVER send `temperature`.
+- For GPT-5 models ("gpt-5", "gpt-5-pro", "gpt-5.2"), we use the Responses API and NEVER send `temperature`.
 - HeyGen integration supports only a **video avatar**:
     * character = {"type": "avatar", "avatar_id": "..."}
 - This version prefers the **HeyGen audio-asset flow**:
@@ -104,7 +104,7 @@ def require_login() -> None:
 # Defaults / Config
 # -------------------------------
 DEFAULT_EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
-DEFAULT_GEN_MODEL = os.getenv("GEN_MODEL", "gpt-5.2-pro")
+DEFAULT_GEN_MODEL = os.getenv("GEN_MODEL", "gpt-5.2")
 DEFAULT_VECTOR_STORE_DIR = Path(os.getenv("VECTOR_STORE_DIR", ".vector_store"))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -144,6 +144,47 @@ def slugify(s: str) -> str:
 
 def is_gpt5(model: str) -> bool:
     return model and model.strip().lower().startswith("gpt-5")
+
+
+# -------------------------------
+# GPT-5.2 Responses API helper (YOUR REQUESTED SYNTAX)
+# -------------------------------
+G52_DEFAULT_INCLUDE = [
+    "reasoning.encrypted_content",
+    "web_search_call.action.sources",
+]
+
+
+def responses_create_gpt52(
+    client: OpenAI,
+    *,
+    input: list,
+    tools: list | None = None,
+    text_format_type: str = "text",          # "text" or "json_object"
+    verbosity: str = "medium",               # "low" | "medium" | "high"
+    reasoning_effort: str = "medium",        # "low" | "medium" | "high"
+    reasoning_summary: str = "auto",         # "auto"
+    max_output_tokens: int | None = None,
+    store: bool = True,
+    include: list[str] | None = None,
+):
+    """
+    Standardized GPT-5.2 Responses API call using the requested syntax.
+    Always uses model="gpt-5.2".
+    """
+    kwargs: Dict[str, Any] = {
+        "model": "gpt-5.2",
+        "input": input,
+        "text": {"format": {"type": text_format_type}, "verbosity": verbosity},
+        "reasoning": {"effort": reasoning_effort, "summary": reasoning_summary},
+        "tools": tools or [],
+        "store": store,
+        "include": include or G52_DEFAULT_INCLUDE,
+    }
+    if max_output_tokens is not None:
+        kwargs["max_output_tokens"] = int(max_output_tokens)
+
+    return client.responses.create(**kwargs)
 
 
 # -------------------------------
@@ -219,7 +260,7 @@ def _extract_text_from_responses(resp: Any) -> str:
         d = resp if isinstance(resp, dict) else None
 
     if isinstance(d, dict):
-        chunks: List[str] = []
+        chunks = []
         output = d.get("output") or []
         for out in output:
             content_list = out.get("content", []) or []
@@ -332,7 +373,7 @@ def embed_texts(client: OpenAI, texts: List[str], embed_model: str) -> np.ndarra
     embeddings: List[List[float]] = []
     batch = 128
     for i in range(0, len(texts), batch):
-        resp = client.embeddings.create(model=embed_model, input=texts[i : i + batch])
+        resp = client.embeddings.create(model=embed_model, input=texts[i: i + batch])
         embeddings.extend([d.embedding for d in resp.data])
     return np.array(embeddings, dtype=np.float32)
 
@@ -398,12 +439,18 @@ def retrieve_top_k(topic: str, meta: Dict[str, Any], client: OpenAI, embed_model
 
 
 def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+    # GPT-5 path: always use GPT-5.2 syntax (per your request)
     if is_gpt5(model):
-        resp = client.responses.create(
-            model=model,
+        resp = responses_create_gpt52(
+            client,
             input=messages,
-            text={"format": {"type": "text"}, "verbosity": "medium"},
+            tools=[],
+            text_format_type="text",
+            verbosity="medium",
+            reasoning_effort="medium",
+            reasoning_summary="auto",
             max_output_tokens=900,
+            store=True,
         )
 
         # 1) Preferred: SDK helper
@@ -411,7 +458,7 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         if isinstance(ot, str) and ot.strip():
             return ot.strip()
 
-        # 2) Fallback: your parser
+        # 2) Fallback: parser
         text = _extract_text_from_responses(resp)
         if text and text.strip():
             return text.strip()
@@ -422,7 +469,7 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         except Exception:
             dumped = resp if isinstance(resp, dict) else {"type": str(type(resp))}
         raise RuntimeError(
-            "No text content returned by GPT-5 response. "
+            "No text content returned by GPT-5.2 response. "
             f"Output item types: {[o.get('type') if isinstance(o, dict) else getattr(o,'type',None) for o in (dumped.get('output') or [])]}"
         )
 
@@ -436,9 +483,8 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
     return (resp.choices[0].message.content or "").strip()
 
 
-
 # -------------------------------
-# News helper (web_search via o4-mini)
+# News helper (web_search via GPT-5.2 syntax)
 # -------------------------------
 def fetch_pakistan_people_news_from_web(
     client: OpenAI,
@@ -484,13 +530,12 @@ def fetch_pakistan_people_news_from_web(
             "Prefer credible business/tech sources."
         )
 
-    resp = client.responses.create(
-        model="o4-mini",
+    resp = responses_create_gpt52(
+        client,
         input=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        text={"format": {"type": "text"}, "verbosity": "medium"},
         tools=[
             {
                 "type": "web_search",
@@ -498,7 +543,13 @@ def fetch_pakistan_people_news_from_web(
                 "search_context_size": "medium",
             }
         ],
+        text_format_type="text",
+        verbosity="medium",
+        reasoning_effort="medium",
+        reasoning_summary="auto",
         max_output_tokens=900,
+        store=True,
+        include=G52_DEFAULT_INCLUDE,  # ensures sources are included when available
     )
 
     content = _extract_text_from_responses(resp)
@@ -560,11 +611,16 @@ FACT_VERIFY_SYS = (
 def extract_claims(client: OpenAI, model: str, script: str) -> List[str]:
     msg = [{"role": "system", "content": FACT_EXTRACT_SYS}, {"role": "user", "content": script}]
     if is_gpt5(model):
-        resp = client.responses.create(
-            model=model,
+        resp = responses_create_gpt52(
+            client,
             input=msg,
-            text={"format": {"type": "json_object"}, "verbosity": "medium"},
+            tools=[],
+            text_format_type="json_object",
+            verbosity="medium",
+            reasoning_effort="medium",
+            reasoning_summary="auto",
             max_output_tokens=700,
+            store=True,
         )
         content = _extract_text_from_responses(resp)
     else:
@@ -599,11 +655,16 @@ def verify_claim(client: OpenAI, model: str, claim: str, evidence: List[Dict[str
     ]
 
     if is_gpt5(model):
-        resp = client.responses.create(
-            model=model,
+        resp = responses_create_gpt52(
+            client,
             input=messages,
-            text={"format": {"type": "json_object"}, "verbosity": "medium"},
+            tools=[],
+            text_format_type="json_object",
+            verbosity="medium",
+            reasoning_effort="medium",
+            reasoning_summary="auto",
             max_output_tokens=450,
+            store=True,
         )
         content = _extract_text_from_responses(resp)
     else:
@@ -656,11 +717,16 @@ def apply_corrections_and_citations(
     ]
 
     if is_gpt5(model):
-        resp = client.responses.create(
-            model=model,
+        resp = responses_create_gpt52(
+            client,
             input=messages,
-            text={"format": {"type": "text"}, "verbosity": "medium"},
+            tools=[],
+            text_format_type="text",
+            verbosity="medium",
+            reasoning_effort="medium",
+            reasoning_summary="auto",
             max_output_tokens=900,
+            store=True,
         )
         revised = _extract_text_from_responses(resp)
     else:
@@ -755,7 +821,6 @@ def eleven_tts(
 
     # ✅ Better error for the exact issue you’re seeing
     if r.status_code == 401:
-        # ElevenLabs often uses 401 for invalid key OR voice not accessible under this key. :contentReference[oaicite:1]{index=1}
         raise RuntimeError(
             "ElevenLabs 401 Unauthorized.\n"
             "- Confirm ELEVENLABS_API_KEY is correct (no extra spaces/newlines)\n"
@@ -919,7 +984,7 @@ with st.sidebar:
     is_g5 = is_gpt5(gen_model)
     temperature = st.slider("Temperature", 0.0, 1.2, 0.7, 0.1, disabled=is_g5)
     if is_g5:
-        st.caption("Note: GPT-5 ignores temperature. Using Responses API (minimal stable call).")
+        st.caption("Note: GPT-5 uses gpt-5.2 syntax (Responses API). Temperature is ignored.")
 
     st.divider()
     k = st.slider("Top-k retrieved chunks", 1, 20, 15)
@@ -1194,7 +1259,7 @@ def on_apply_script_changes():
 
 
 # -------------------------------
-# Generate flow (this is what was broken before due to indentation)
+# Generate flow
 # -------------------------------
 if clicked and not topic:
     st.warning("Please enter a topic or select a news item first.")
@@ -1330,7 +1395,7 @@ if clicked and topic and st.session_state.get("meta"):
         }
     )
 
-    # ✅ SHOW THE SCRIPT UI (this was the broken indentation in your old file)
+    # SHOW THE SCRIPT UI
     current_script_text = script_box.text_area(
         "Generated script",
         value=script,
