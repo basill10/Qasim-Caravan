@@ -706,21 +706,22 @@ def eleven_tts(
     style: float | None = None,
     use_speaker_boost: bool | None = None,
 ) -> bytes:
+    api_key = (api_key or "").strip()
+    voice_id = (voice_id or "").strip()
+
     if not api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY not set.")
+        raise RuntimeError("ELEVENLABS_API_KEY not set (or only whitespace).")
     if not voice_id:
-        raise RuntimeError("Please select a voice.")
+        raise RuntimeError("Please select a voice (voice_id is empty).")
 
     headers = {
         "xi-api-key": api_key,
-        "accept": "audio/mpeg",
-        "content-type": "application/json",
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
     }
 
-    payload: Dict[str, Any] = {
-        "text": text,
-        "model_id": model_id,
-    }
+    payload: Dict[str, Any] = {"text": text, "model_id": model_id}
+
     voice_settings: Dict[str, Any] = {}
     if stability is not None:
         voice_settings["stability"] = float(stability)
@@ -735,6 +736,17 @@ def eleven_tts(
 
     url = f"{ELEVEN_BASE}/text-to-speech/{voice_id}"
     r = requests.post(url, headers=headers, json=payload, timeout=120)
+
+    # ✅ Better error for the exact issue you’re seeing
+    if r.status_code == 401:
+        # ElevenLabs often uses 401 for invalid key OR voice not accessible under this key. :contentReference[oaicite:1]{index=1}
+        raise RuntimeError(
+            "ElevenLabs 401 Unauthorized.\n"
+            "- Confirm ELEVENLABS_API_KEY is correct (no extra spaces/newlines)\n"
+            "- Re-select a voice after changing the key (voice_id must belong to the same account)\n\n"
+            f"Response: {r.text}"
+        )
+
     r.raise_for_status()
     return r.content
 
