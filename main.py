@@ -179,78 +179,38 @@ def is_gpt5(model: str) -> bool:
 # -------------------------------
 REFERENCES_HEADER_RE = re.compile(r"^\s*references\s*:\s*$", re.IGNORECASE)
 
-# Common domain TLDs you’ll see in citations
-_DOMAIN_TLDS = r"(?:com|pk|org|net|io|co|gov|edu|info|tv|me)"
+# -------------------------------
+# Voiceover script helpers (o4-mini only, no fallbacks)
+# -------------------------------
+VOICEOVER_CLEAN_SYS = (
+    "You are an expert voiceover script cleaner.\n"
+    "Task: Convert the input reel script into a clean voiceover script.\n"
+    "Rules:\n"
+    "- Output ONLY the cleaned voiceover script (no titles, no markdown, no notes).\n"
+    "- Remove ALL citations like [1], [2], and remove any References section entirely.\n"
+    "- Remove ALL URLs/domains and any 'Source:' lines.\n"
+)
 
-def make_clean_voiceover_script(script_with_sources: str) -> str:
-    """
-    Create a 'clean' voiceover script from the generated script:
-    - Removes trailing References section (and anything after it)
-    - Removes inline citation markers like [1], [2] (keeps the text)
-    - Removes URLs (http/https)
-    - Removes markdown links like ([site](url)) AND broken forms like ([site](
-    - Removes bare domains in parentheses/brackets like (gritdaily.com) or [gritdaily.com]
-    - Removes common "Source:" lines
-    """
-    if not script_with_sources:
+def make_clean_voiceover_script(client: OpenAI, script_with_sources: str) -> str:
+    if not script_with_sources or not script_with_sources.strip():
         return ""
 
-    lines = script_with_sources.splitlines()
-
-    # 1) Cut off at "References:" section if present
-    cut_idx = None
-    for i, line in enumerate(lines):
-        if REFERENCES_HEADER_RE.match(line.strip()):
-            cut_idx = i
-            break
-    if cut_idx is not None:
-        lines = lines[:cut_idx]
-
-    text = "\n".join(lines)
-
-    # 2) Remove inline [n] markers (citations), but keep the text
-    text = re.sub(r"\[(\d{1,3})\]", "", text)
-
-    # 3) Remove full markdown links: ([label](url)) or [label](url)
-    text = re.sub(r"\(\s*\[[^\]]+\]\([^)]+\)\s*\)", "", text)   # wrapped in parens
-    text = re.sub(r"\[[^\]]+\]\([^)]+\)", "", text)            # not wrapped
-
-    # 4) Remove broken/incomplete markdown links to end-of-line: ([gritdaily.com](
-    text = re.sub(r"\(\s*\[[^\]]+\]\([^\n]*", "", text)
-    text = re.sub(r"\[[^\]]+\]\([^\n]*", "", text)
-
-    # 5) Remove bare URLs anywhere
-    text = re.sub(r"https?://\S+", "", text)
-
-    # 6) Remove "Source: ..." lines/fragments
-    text = re.sub(r"(?im)^\s*source\s*:\s*\S+\s*$", "", text)
-
-    # 7) Remove bare domains in parentheses: (gritdaily.com) / (www.site.pk/foo)
-    text = re.sub(
-        rf"\(\s*(?:www\.)?[a-z0-9.-]+\.{_DOMAIN_TLDS}(?:/[^\s)]*)?\s*\)",
-        "",
-        text,
-        flags=re.IGNORECASE,
+    resp = client.responses.create(
+        model="o4-mini",
+        input=[
+            {"role": "system", "content": VOICEOVER_CLEAN_SYS},
+            {"role": "user", "content": script_with_sources},
+        ],
+        text={"format": {"type": "text"}, "verbosity": "medium"},
+        max_output_tokens=700,
     )
 
-    # 8) Remove bare domains in brackets: [gritdaily.com]
-    text = re.sub(
-        rf"\[\s*(?:www\.)?[a-z0-9.-]+\.{_DOMAIN_TLDS}(?:/[^\s\]]*)?\s*\]",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
+    out = _extract_text_from_responses(resp).strip()
+    if not out:
+        raise RuntimeError("o4-mini returned empty output while cleaning voiceover script.")
+    return out
 
-    # 9) Clean leftover whitespace/punctuation gaps
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"\s+\.", ".", text)          # " ." -> "."
-    text = re.sub(r"\(\s*\)", "", text)         # remove empty ()
-    text = re.sub(r"\[\s*\]", "", text)         # remove empty []
-    text = re.sub(r"\s{2,}", " ", text)         # collapse repeated spaces (within lines)
-    text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
-
-    return text
+    
 
 
 
@@ -1439,7 +1399,10 @@ if clicked and topic and st.session_state.get("meta"):
 
     
     
-    clean_voiceover = make_clean_voiceover_script(script)
+    clean_voiceover = make_clean_voiceover_script(client, script)
+    st.session_state["voiceover_script_text"] = clean_voiceover
+
+
 
     st.session_state.update(
         {
@@ -1464,7 +1427,7 @@ if clicked and topic and st.session_state.get("meta"):
     st.caption("Tip: This is the full script. If Fact Checking + citations is enabled, it may include [n] markers and a References section.")
 
     # Box 2: Voiceover script (clean, no sources)
-    default_voiceover = st.session_state.get("last_voiceover_script") or make_clean_voiceover_script(current_script_text)
+    default_voiceover = st.session_state.get("last_voiceover_script") or make_clean_voiceover_script(client, current_script_text)
     current_voiceover_text = voiceover_box.text_area(
         "Voiceover script",
         value=st.session_state.get("voiceover_script_text", default_voiceover),
@@ -1496,7 +1459,7 @@ if clicked and topic and st.session_state.get("meta"):
             st.error(f"Failed to apply changes: {e}")
 
     if reset_voiceover:
-        st.session_state["voiceover_script_text"] = make_clean_voiceover_script(current_script_text)
+        st.session_state["voiceover_script_text"] = make_clean_voiceover_script(client, current_script_text)
         st.session_state["voiceover_change_request"] = ""
         st.toast("Voiceover script reset", icon="🔄")
         st.rerun()
