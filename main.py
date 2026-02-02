@@ -41,6 +41,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
+from datetime import timedelta
 
 import numpy as np
 import requests
@@ -445,38 +446,85 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
 
 
 # -------- NEW: story ideas from web (Pakistan) --------
-def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -> List[str]:
+# -------- NEW: founders/creators news finder from web (Pakistan) --------
+def fetch_pakistan_people_news_from_web(
+    client: OpenAI,
+    *,
+    kind: str,  # "creators" or "founders"
+    days_back: int,
+    name_filter: str = "",
+    max_items: int = 8,
+) -> List[Dict[str, str]]:
     """
-    Use GPT + web_search to propose concise, reel-ready story ideas
-    about current, factual developments in Pakistan.
+    Uses o4-mini + web_search to find recent news about:
+      - creators: Pakistani YouTubers / internet personalities (positive/uplifting only)
+      - founders: Pakistani founders (startup/tech/business)
+    Returns list of dicts: {name, headline, summary, url, published}
     """
 
-    system_msg = (
-        "You are a Pakistan-based news researcher for Instagram reels.\n"
-        "You propose concise, reel-worthy story titles about recent, factual developments "
-        "in Pakistan's business, tech, culture, or economy that can be reported on.\n"
-        "Each idea should be:\n"
-        "- grounded in real, verifiable events (use web search)\n"
-        "- neutral, factual, non-clickbait\n"
-        "- at most 15 words\n"
-        "- suitable as a reel topic title (no numbering, no emojis, no hashtags).\n"
-        "Return ONLY a single JSON object of the form:\n"
-        "    {\"ideas\": [\"...\", \"...\"]}\n"
-        "No extra commentary or formatting."
-    )
+    kind_norm = (kind or "").strip().lower()
+    if kind_norm not in {"creators", "founders"}:
+        raise ValueError("kind must be 'creators' or 'founders'")
 
-    user_msg = f"Generate {max_ideas} distinct story titles."
+    # Compute an explicit cutoff date to help the model craft search queries
+    now_utc = datetime.utcnow()
+    cutoff = now_utc - timedelta(days=int(days_back))
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    name_filter = (name_filter or "").strip()
+
+    if kind_norm == "creators":
+        system_msg = (
+            "You are a careful Pakistan news researcher.\n"
+            "Task: Search the web for recent news on Pakistani YouTubers and Internet personalities.\n"
+            "For each, list:\n"
+            "- Creator name\n"
+            "- News headline\n"
+            "- Summary (1–2 sentences)\n"
+            "- Source URL\n"
+            "- Published date if available\n\n"
+            "Strict safety/content rules:\n"
+            "- ONLY include positive, educational, inspiring, or uplifting news.\n"
+            "- Do NOT include any 18+ content, explicit material, sexual content, deepfake scandals, harassment, or harmful content.\n"
+            "- If an item is even borderline scandal/controversy, skip it.\n"
+            "- Prefer reputable sources and official announcements.\n\n"
+            "Return ONLY JSON in this format:\n"
+            "{\"items\": [{\"name\":\"...\",\"headline\":\"...\",\"summary\":\"...\",\"url\":\"...\",\"published\":\"...\"}]}\n"
+            "No extra text."
+        )
+        user_msg = (
+            f"Find up to {max_items} items from the last {days_back} days (cutoff date: {cutoff_str}).\n"
+            f"{'Focus on this creator/person name: ' + name_filter if name_filter else 'No specific name filter.'}\n"
+            "Make sure results are Pakistan-relevant and within the date range.\n"
+            "Avoid gossip/scandal sites."
+        )
+    else:
+        system_msg = (
+            "You are a careful Pakistan business/startup news researcher.\n"
+            "Task: Search the web for recent news on Pakistani founders.\n"
+            "For each, list:\n"
+            "- Founder name\n"
+            "- News headline\n"
+            "- Summary (1–2 sentences)\n"
+            "- Source URL\n"
+            "- Published date if available\n\n"
+            "Return ONLY JSON in this format:\n"
+            "{\"items\": [{\"name\":\"...\",\"headline\":\"...\",\"summary\":\"...\",\"url\":\"...\",\"published\":\"...\"}]}\n"
+            "No extra text."
+        )
+        user_msg = (
+            f"Find up to {max_items} items from the last {days_back} days (cutoff date: {cutoff_str}).\n"
+            f"{'Focus on this founder name: ' + name_filter if name_filter else 'No specific name filter.'}\n"
+            "Pakistan-relevant founders only. Prefer credible sources."
+        )
 
     resp = client.responses.create(
-        model=model,
+        model="o4-mini",
         input=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        text={
-            "format": {"type": "text"},  # MUST be text when using web_search
-            "verbosity": "medium",
-        },
+        text={"format": {"type": "text"}, "verbosity": "medium"},
         reasoning={"effort": "medium", "summary": "auto"},
         tools=[
             {
@@ -486,34 +534,47 @@ def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -
             }
         ],
         store=True,
-        include=[
-            "reasoning.encrypted_content",
-            "web_search_call.action.sources",
-        ],
-        max_output_tokens=400,
+        include=["reasoning.encrypted_content", "web_search_call.action.sources"],
+        max_output_tokens=800,
     )
 
     content = _extract_text_from_responses(resp)
     if not content:
-        raise RuntimeError("Empty response when fetching story ideas.")
+        return []
 
-    # Parse JSON out of the text
+    # Parse JSON from the model response
     try:
         data = json.loads(content)
     except Exception:
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
-            raise RuntimeError(f"Could not parse JSON from story ideas: {content!r}")
+            return []
         data = json.loads(m.group(0))
 
-    ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
-    if not ideas:
-        raise RuntimeError(f"No ideas found in parsed result: {data!r}")
+    items = data.get("items") or []
+    out: List[Dict[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        headline = str(it.get("headline") or "").strip()
+        summary = str(it.get("summary") or "").strip()
+        url = str(it.get("url") or "").strip()
+        published = str(it.get("published") or "").strip()
 
-    return ideas[:max_ideas]
+        if not (name and headline and summary):
+            continue
+        out.append(
+            {
+                "name": name,
+                "headline": headline,
+                "summary": summary,
+                "url": url,
+                "published": published,
+            }
+        )
 
-
-
+    return out[:max_items]
 
 
 # -------------------------------
@@ -1020,37 +1081,113 @@ colg = st.columns([1, 1, 2, 2])
 clicked = colg[0].button("Generate", type="primary", use_container_width=True)
 
 # NEW: button to fetch Pakistan story ideas from web
-suggest_btn = colg[1].button("Find ideas", use_container_width=True)
+suggest_btn = colg[1].button("Find news", use_container_width=True)
 
 if suggest_btn:
     if not st.session_state.get("openai_api_key"):
-        st.error("Add your OPENAI_API_KEY in the sidebar to fetch story ideas.")
+        st.error("Add your OPENAI_API_KEY in the sidebar to fetch news.")
     else:
         try:
             client = get_openai_client(st.session_state.get("openai_api_key"))
-            with st.spinner("Looking up fresh Pakistan stories…"):
-                ideas = fetch_story_ideas_from_web(client, gen_model, max_ideas=5)
-            if not ideas:
-                st.warning("Could not find story ideas. Try again in a bit.")
-            else:
-                st.session_state["web_story_ideas"] = ideas
-                st.toast("Loaded story ideas from web", icon="📰")
-        except Exception as e:
-            st.error(f"Fetching story ideas failed: {e}")
 
-# Show ideas (if any) and allow user to auto-fill Topic
-if st.session_state.get("web_story_ideas"):
-    with st.expander("Story ideas from Pakistan news", expanded=True):
-        choice = st.radio(
-            "Pick a story idea to auto-fill Topic",
-            st.session_state["web_story_ideas"],
-            key="story_idea_radio",
+            # Initialize defaults if missing
+            if "news_kind" not in st.session_state:
+                st.session_state["news_kind"] = "Creators"
+            if "news_range" not in st.session_state:
+                st.session_state["news_range"] = "One week"
+            if "news_name_filter" not in st.session_state:
+                st.session_state["news_name_filter"] = ""
+
+            kind_ui = st.session_state["news_kind"]
+            range_ui = st.session_state["news_range"]
+            name_filter = st.session_state["news_name_filter"]
+
+            days_map = {
+                "One day": 1,
+                "One week": 7,
+                "One month": 30,
+                "3 months": 90,
+                "6 months": 180,
+                "One year": 365,
+            }
+            days_back = days_map.get(range_ui, 7)
+
+            kind_key = "creators" if kind_ui.lower().startswith("creator") else "founders"
+
+            with st.spinner("Searching the web…"):
+                items = fetch_pakistan_people_news_from_web(
+                    client,
+                    kind=kind_key,
+                    days_back=days_back,
+                    name_filter=name_filter,
+                    max_items=8,
+                )
+
+            st.session_state["web_news_items"] = items
+            st.toast("Loaded news from web", icon="📰")
+
+        except Exception as e:
+            st.error(f"Fetching news failed: {e}")
+
+
+# Controls + results for web news finder
+with st.expander("Find Pakistani founders / creators (web)", expanded=False):
+    st.session_state["news_kind"] = st.radio(
+        "Choose type",
+        ["Creators", "Founders"],
+        index=0 if st.session_state.get("news_kind", "Creators") == "Creators" else 1,
+        key="news_kind_radio",
+    )
+
+    st.session_state["news_range"] = st.selectbox(
+        "Date range",
+        ["One day", "One week", "One month", "3 months", "6 months", "One year"],
+        index=["One day", "One week", "One month", "3 months", "6 months", "One year"].index(
+            st.session_state.get("news_range", "One week")
+        ),
+        key="news_range_select",
+    )
+
+    st.session_state["news_name_filter"] = st.text_input(
+        "Name filter (optional)",
+        value=st.session_state.get("news_name_filter", ""),
+        placeholder="e.g., 'Mooroo' or 'Monis Rahman'",
+        key="news_name_filter_input",
+    )
+
+    st.caption("Tip: Click **Find news** above after setting filters.")
+
+    items = st.session_state.get("web_news_items") or []
+    if not items:
+        st.info("No results yet. Set filters here, then click **Find news**.")
+    else:
+        # Show selection + details
+        labels = [
+            f"{it.get('name','')} — {it.get('headline','')}"[:140]
+            for it in items
+        ]
+        selected_idx = st.radio(
+            "Pick one result",
+            list(range(len(labels))),
+            format_func=lambda i: labels[i],
+            key="web_news_pick_radio",
         )
-        use_idea = st.button("Use selected idea as Topic", key="use_story_idea_btn")
-        if use_idea and choice:
-            st.session_state["topic_input"] = choice
-            # Rerun so the updated topic shows in the text_input
-            st.experimental_rerun()
+
+        chosen = items[selected_idx] if 0 <= selected_idx < len(items) else None
+        if chosen:
+            st.markdown(f"**Name:** {chosen.get('name','')}")
+            st.markdown(f"**Headline:** {chosen.get('headline','')}")
+            st.markdown(f"**Summary:** {chosen.get('summary','')}")
+            if chosen.get("published"):
+                st.markdown(f"**Published:** {chosen.get('published')}")
+            if chosen.get("url"):
+                st.markdown(f"**Source:** {chosen.get('url')}")
+
+            use_as_topic = st.button("Use selected headline as Topic", key="use_news_headline_as_topic_btn")
+            if use_as_topic and chosen.get("headline"):
+                st.session_state["topic_input"] = chosen["headline"]
+                st.experimental_rerun()
+
 
 # Output containers
 script_box = st.empty()
