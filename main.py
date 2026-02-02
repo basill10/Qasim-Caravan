@@ -1596,9 +1596,9 @@ def on_apply_script_changes():
         else:
             st.caption("No HeyGen video yet. Render to preview.")
 
-elif clicked and not topic:
+if clicked and not topic:
     st.warning("Enter a topic first.")
-elif clicked and not st.session_state.get("meta"):
+if clicked and not st.session_state.get("meta"):
     st.warning("Corpus index not ready. Ensure `scripts.txt` is present and index built successfully.")
 
 # If user didn't click this run, keep previous results available (so buttons work after rerun)
