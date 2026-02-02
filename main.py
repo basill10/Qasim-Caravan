@@ -1404,6 +1404,33 @@ if clicked and topic and st.session_state.get("meta"):
 
 )
 
+def on_apply_script_changes():
+    if not st.session_state.get("openai_api_key"):
+        st.session_state["edit_error"] = "Add your OPENAI_API_KEY in the sidebar to apply changes."
+        return
+
+    try:
+        client = get_openai_client(st.session_state.get("openai_api_key"))
+
+        revised = revise_script_o4mini(
+            client,
+            st.session_state.get("generated_script_text", ""),
+            st.session_state.get("script_edit_request", ""),
+        )
+
+        # ✅ SAFE: this runs before widgets are created
+        st.session_state["last_script"] = revised
+        st.session_state["generated_script_text"] = revised
+        st.session_state["script_edit_request"] = ""
+
+        # invalidate downstream assets
+        st.session_state.pop("audio_bytes", None)
+        st.session_state.pop("heygen_video_url", None)
+
+        st.session_state.pop("edit_error", None)
+
+    except Exception as e:
+        st.session_state["edit_error"] = f"Edit failed: {e}"
 
 
   
@@ -1425,32 +1452,17 @@ if clicked and topic and st.session_state.get("meta"):
         height=100,
     )
 
-    apply_changes = st.button(
-        "Apply changes (o4-mini)",
-        use_container_width=True,
-        disabled=not edit_request.strip(),
-    )
+    
+    st.button(
+    "Apply changes (o4-mini)",
+    use_container_width=True,
+    disabled=not st.session_state.get("script_edit_request", "").strip(),
+    on_click=on_apply_script_changes,
+)
+    if st.session_state.get("edit_error"):
+        st.error(st.session_state["edit_error"])
 
-    if apply_changes:
-        if not st.session_state.get("openai_api_key"):
-            st.error("Add your OPENAI_API_KEY in the sidebar to apply changes.")
-        else:
-            try:
-                with st.spinner("Applying changes with o4-mini…"):
-                    revised = revise_script_o4mini(client, current_script_text, edit_request)
 
-                # Update what the user sees + what the app remembers
-                st.session_state["last_script"] = revised
-                st.session_state["generated_script_text"] = revised
-                st.session_state["script_edit_request"] = ""  # optional: clear box
-
-                # edits invalidate downstream assets
-                st.session_state.pop("audio_bytes", None)
-                st.session_state.pop("heygen_video_url", None)
-
-                st.rerun()
-            except Exception as e:
-                st.error(f"Edit failed: {e}")
 
     st.caption("Tip: If Fact Checking + citations is enabled, it may include [n] markers and a References section.")
 
@@ -1613,31 +1625,16 @@ if not clicked and st.session_state.get("has_script"):
         height=100,
     )
 
-    apply_changes = st.button(
-        "Apply changes (o4-mini)",
-        use_container_width=True,
-        disabled=not edit_request.strip(),
-    )
+    st.button(
+    "Apply changes (o4-mini)",
+    use_container_width=True,
+    disabled=not st.session_state.get("script_edit_request", "").strip(),
+    on_click=on_apply_script_changes,
+)
+    if st.session_state.get("edit_error"):
+        st.error(st.session_state["edit_error"])
 
-    if apply_changes:
-        if not st.session_state.get("openai_api_key"):
-            st.error("Add your OPENAI_API_KEY in the sidebar to apply changes.")
-        else:
-            try:
-                client = get_openai_client(st.session_state.get("openai_api_key"))
-                with st.spinner("Applying changes with o4-mini…"):
-                    revised = revise_script_o4mini(client, current_script_text, edit_request)
-
-                st.session_state["last_script"] = revised
-                st.session_state["generated_script_text"] = revised
-                st.session_state["script_edit_request"] = ""
-
-                st.session_state.pop("audio_bytes", None)
-                st.session_state.pop("heygen_video_url", None)
-
-                st.rerun()
-            except Exception as e:
-                st.error(f"Edit failed: {e}")
+            
 
 
     # Downloads (script + optional fact report)
