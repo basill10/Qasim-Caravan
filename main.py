@@ -445,8 +445,6 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         raise RuntimeError("No text content returned by Responses fallback.")
 
 
-# -------- NEW: story ideas from web (Pakistan) --------
-# -------- NEW: founders/creators news finder from web (Pakistan) --------
 def fetch_pakistan_people_news_from_web(
     client: OpenAI,
     *,
@@ -455,77 +453,48 @@ def fetch_pakistan_people_news_from_web(
     name_filter: str = "",
     max_items: int = 8,
 ) -> List[Dict[str, str]]:
-    """
-    Uses o4-mini + web_search to find recent news about:
-      - creators: Pakistani YouTubers / internet personalities (positive/uplifting only)
-      - founders: Pakistani founders (startup/tech/business)
-    Returns list of dicts: {name, headline, summary, url, published}
-    """
-
     kind_norm = (kind or "").strip().lower()
     if kind_norm not in {"creators", "founders"}:
         raise ValueError("kind must be 'creators' or 'founders'")
 
-    # Compute an explicit cutoff date to help the model craft search queries
     now_utc = datetime.utcnow()
-    cutoff = now_utc - timedelta(days=int(days_back))
+    cutoff = now_utc - timedelta(days=max(1, int(days_back)))
     cutoff_str = cutoff.strftime("%Y-%m-%d")
-
     name_filter = (name_filter or "").strip()
 
     if kind_norm == "creators":
         system_msg = (
             "You are a careful Pakistan news researcher.\n"
-            "Task: Search the web for recent news on Pakistani YouTubers and Internet personalities.\n"
-            "For each, list:\n"
-            "- Creator name\n"
-            "- News headline\n"
-            "- Summary (1–2 sentences)\n"
-            "- Source URL\n"
-            "- Published date if available\n\n"
-            "Strict safety/content rules:\n"
-            "- ONLY include positive, educational, inspiring, or uplifting news.\n"
-            "- Do NOT include any 18+ content, explicit material, sexual content, deepfake scandals, harassment, or harmful content.\n"
-            "- If an item is even borderline scandal/controversy, skip it.\n"
-            "- Prefer reputable sources and official announcements.\n\n"
-            "Return ONLY JSON in this format:\n"
-            "{\"items\": [{\"name\":\"...\",\"headline\":\"...\",\"summary\":\"...\",\"url\":\"...\",\"published\":\"...\"}]}\n"
-            "No extra text."
+            "Search the web for recent news on Pakistani YouTubers and Internet personalities.\n"
+            "ONLY include positive, educational, inspiring, or uplifting news.\n"
+            "Skip scandals/controversy.\n"
+            "Return a JSON object with key 'items' (array of objects) exactly.\n"
+            "Each item must include: name, headline, summary, url, published.\n"
         )
         user_msg = (
-            f"Find up to {max_items} items from the last {days_back} days (cutoff date: {cutoff_str}).\n"
-            f"{'Focus on this creator/person name: ' + name_filter if name_filter else 'No specific name filter.'}\n"
-            "Make sure results are Pakistan-relevant and within the date range.\n"
-            "Avoid gossip/scandal sites."
+            f"Find up to {max_items} items from the last {days_back} days (cutoff: {cutoff_str}).\n"
+            f"{'Focus on this name: ' + name_filter if name_filter else ''}"
         )
     else:
         system_msg = (
             "You are a careful Pakistan business/startup news researcher.\n"
-            "Task: Search the web for recent news on Pakistani founders.\n"
-            "For each, list:\n"
-            "- Founder name\n"
-            "- News headline\n"
-            "- Summary (1–2 sentences)\n"
-            "- Source URL\n"
-            "- Published date if available\n\n"
-            "Return ONLY JSON in this format:\n"
-            "{\"items\": [{\"name\":\"...\",\"headline\":\"...\",\"summary\":\"...\",\"url\":\"...\",\"published\":\"...\"}]}\n"
-            "No extra text."
+            "Search the web for recent news on Pakistani founders.\n"
+            "Return a JSON object with key 'items' (array of objects) exactly.\n"
+            "Each item must include: name, headline, summary, url, published.\n"
         )
         user_msg = (
-            f"Find up to {max_items} items from the last {days_back} days (cutoff date: {cutoff_str}).\n"
-            f"{'Focus on this founder name: ' + name_filter if name_filter else 'No specific name filter.'}\n"
-            "Pakistan-relevant founders only. Prefer credible sources."
+            f"Find up to {max_items} items from the last {days_back} days (cutoff: {cutoff_str}).\n"
+            f"{'Focus on this name: ' + name_filter if name_filter else ''}"
         )
 
+    # ✅ Force strict JSON output from the model
     resp = client.responses.create(
         model="o4-mini",
         input=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        text={"format": {"type": "text"}, "verbosity": "medium"},
-        reasoning={"effort": "medium", "summary": "auto"},
+        text={"format": {"type": "json_object"}, "verbosity": "medium"},
         tools=[
             {
                 "type": "web_search",
@@ -533,48 +502,51 @@ def fetch_pakistan_people_news_from_web(
                 "search_context_size": "medium",
             }
         ],
-        store=True,
-        include=["reasoning.encrypted_content", "web_search_call.action.sources"],
-        max_output_tokens=800,
+        max_output_tokens=900,
     )
 
     content = _extract_text_from_responses(resp)
     if not content:
         return []
 
-    # Parse JSON from the model response
+    # Parse JSON (now should be valid)
     try:
         data = json.loads(content)
     except Exception:
+        # If anything still slips through, try to extract first JSON object
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
             return []
         data = json.loads(m.group(0))
 
-    items = data.get("items") or []
+    # ✅ Tolerate alternate top-level keys just in case
+    items = (
+        data.get("items")
+        or data.get("results")
+        or data.get("data")
+        or []
+    )
+
     out: List[Dict[str, str]] = []
     for it in items:
         if not isinstance(it, dict):
             continue
+
         name = str(it.get("name") or "").strip()
-        headline = str(it.get("headline") or "").strip()
-        summary = str(it.get("summary") or "").strip()
-        url = str(it.get("url") or "").strip()
-        published = str(it.get("published") or "").strip()
+        headline = str(it.get("headline") or it.get("title") or "").strip()
+        summary = str(it.get("summary") or it.get("snippet") or "").strip()
+        url = str(it.get("url") or it.get("link") or "").strip()
+        published = str(it.get("published") or it.get("published_date") or "").strip()
 
         if not (name and headline and summary):
             continue
+
         out.append(
-            {
-                "name": name,
-                "headline": headline,
-                "summary": summary,
-                "url": url,
-                "published": published,
-            }
+            {"name": name, "headline": headline, "summary": summary, "url": url, "published": published}
         )
 
     return out[:max_items]
+
 
 
 # -------------------------------
@@ -1010,7 +982,7 @@ with st.sidebar:
     st.session_state["heygen_api_key"] = heygen_api_key
 
     st.caption("Select a VIDEO avatar (avatar_id). Talking-photo (Avatar IV) is disabled in this build.")
-    avatar_id_input = st.text_input("HeyGen AVATAR ID (video avatar)", value="", placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf")
+    avatar_id_input = st.text_input("HeyGen AVATAR ID (video avatar)", value="d53434113ef240969f03d1fd376176e0", placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf")
     st.session_state["avatar_id_input"] = avatar_id_input.strip()
 
     engine = "Video Avatar (Avatar IV disabled)"
@@ -1122,6 +1094,9 @@ if suggest_btn:
                     name_filter=name_filter,
                     max_items=8,
                 )
+                if not items:
+                    st.warning("Web search returned no items. Try widening the date range or removing the name filter.")
+
 
             st.session_state["web_news_items"] = items
             st.toast("Loaded news from web", icon="📰")
