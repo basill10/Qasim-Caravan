@@ -398,18 +398,33 @@ def retrieve_top_k(topic: str, meta: Dict[str, Any], client: OpenAI, embed_model
 
 
 def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
-    # Keep GPT-5 branch minimal & stable (avoids SDK/version mismatches)
     if is_gpt5(model):
         resp = client.responses.create(
             model=model,
             input=messages,
-            text={"format": {"type": "text"}},
+            text={"format": {"type": "text"}, "verbosity": "medium"},
             max_output_tokens=900,
         )
+
+        # 1) Preferred: SDK helper
+        ot = getattr(resp, "output_text", None)
+        if isinstance(ot, str) and ot.strip():
+            return ot.strip()
+
+        # 2) Fallback: your parser
         text = _extract_text_from_responses(resp)
-        if not text:
-            raise RuntimeError("No text content returned by GPT-5 response.")
-        return text
+        if text and text.strip():
+            return text.strip()
+
+        # 3) Debug info if it happens again
+        try:
+            dumped = resp.model_dump()
+        except Exception:
+            dumped = resp if isinstance(resp, dict) else {"type": str(type(resp))}
+        raise RuntimeError(
+            "No text content returned by GPT-5 response. "
+            f"Output item types: {[o.get('type') if isinstance(o, dict) else getattr(o,'type',None) for o in (dumped.get('output') or [])]}"
+        )
 
     # Non-GPT5: use Chat Completions
     resp = client.chat.completions.create(
@@ -419,6 +434,7 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         max_tokens=600,
     )
     return (resp.choices[0].message.content or "").strip()
+
 
 
 # -------------------------------
