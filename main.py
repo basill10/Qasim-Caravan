@@ -1264,10 +1264,10 @@ clicked = colg2[0].button("Generate script", type="primary", use_container_width
 
 
 # Output containers
+# Output containers
 script_box = st.empty()
-voiceover_box = st.empty()
-voiceover_edit_box = st.empty()
 facts_expander = st.expander("Fact-check results", expanded=False)
+
 
 
 
@@ -1399,83 +1399,33 @@ if clicked and topic and st.session_state.get("meta"):
 
     
     
-    clean_voiceover = make_clean_voiceover_script(client, script)
-    st.session_state["voiceover_script_text"] = clean_voiceover
-
-
-
+    
     st.session_state.update(
-        {
-            "has_script": True,
-            "last_script": script,
-            "last_topic": topic,
-            "last_facts_payload": facts_payload,
-            "last_voiceover_script": clean_voiceover,
-        }
+    {
+        "has_script": True,
+        "last_script": script,
+        "last_topic": topic,
+        "last_facts_payload": facts_payload,
+    }
+
+
 )
 
 
 
-    #
-    # Box 1: Generated script (may include citations/references if fact-checking enabled)
+  
+    # Box: Generated script (may include citations/references if fact-checking enabled)
     current_script_text = script_box.text_area(
         "Generated script",
         value=script,
         height=320,
         key="generated_script_text",
     )
-    st.caption("Tip: This is the full script. If Fact Checking + citations is enabled, it may include [n] markers and a References section.")
+    st.caption("Tip: If Fact Checking + citations is enabled, it may include [n] markers and a References section.")
 
-    # Box 2: Voiceover script (clean, no sources)
-    default_voiceover = st.session_state.get("last_voiceover_script") or make_clean_voiceover_script(client, current_script_text)
-    current_voiceover_text = voiceover_box.text_area(
-        "Voiceover script",
-        value=st.session_state.get("voiceover_script_text", default_voiceover),
-        height=260,
-        key="voiceover_script_text",
-    )
-    st.caption("This is the clean script used for audio (no URLs / no References). You can edit it directly too.")
-
-    # Box 3: Change request handled by o4-mini
-    change_request = voiceover_edit_box.text_area(
-        "Request changes to the voiceover script (handled by o4-mini)",
-        placeholder="e.g., Make it more Pakistan-centric, remove jargon, add one concrete number, tighten the hook.",
-        height=120,
-        key="voiceover_change_request",
-    )
-    col_edit_1, col_edit_2, _ = st.columns([1, 1, 3])
-    apply_changes = col_edit_1.button("Apply changes (o4-mini)", use_container_width=True)
-    reset_voiceover = col_edit_2.button("Reset voiceover to clean-from-generated", use_container_width=True)
-
-    if apply_changes:
-        try:
-            client = get_openai_client(st.session_state.get("openai_api_key"))
-            revised = apply_voiceover_changes_o4mini(client, current_voiceover_text, change_request)
-            st.session_state["voiceover_script_text"] = revised
-            st.session_state["voiceover_change_request"] = ""
-            st.toast("Voiceover script updated", icon="✅")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to apply changes: {e}")
-
-    if reset_voiceover:
-        st.session_state["voiceover_script_text"] = make_clean_voiceover_script(client, current_script_text)
-        st.session_state["voiceover_change_request"] = ""
-        st.toast("Voiceover script reset", icon="🔄")
-        st.rerun()
-
-    # Downloads (optional: keep existing + add voiceover download)
+    # Downloads
     download_buttons_area(current_script_text, topic, facts_payload)
 
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"{ts}-{slugify(topic)}"
-    vo_name = f"{base}-voiceover.txt"
-    st.download_button(
-        "Download voiceover script (.txt)",
-        st.session_state.get("voiceover_script_text", current_voiceover_text),
-        file_name=vo_name,
-        mime="text/plain",
-    )
 
 
     # -------------------------------
@@ -1492,11 +1442,11 @@ if clicked and topic and st.session_state.get("meta"):
         regen_audio = c2.button("Regenerate", use_container_width=True)
         do_tts = make_audio or regen_audio
         tts_text = (
-            st.session_state.get("voiceover_script_text")
-            or st.session_state.get("generated_script_text")
+            st.session_state.get("generated_script_text")
             or current_script_text
             or script
         )
+
 
 
         if do_tts:
@@ -1614,6 +1564,7 @@ if not clicked and st.session_state.get("has_script"):
     topic = st.session_state.get("last_topic", "")
     facts_payload = st.session_state.get("last_facts_payload")
 
+    # ONLY show the generated script box
     current_script_text = script_box.text_area(
         "Generated script",
         value=script,
@@ -1621,55 +1572,9 @@ if not clicked and st.session_state.get("has_script"):
         key="generated_script_text",
     )
 
-    # Voiceover script
-    default_voiceover = st.session_state.get("last_voiceover_script") or make_clean_voiceover_script(current_script_text)
-    current_voiceover_text = voiceover_box.text_area(
-        "Voiceover script",
-        value=st.session_state.get("voiceover_script_text", default_voiceover),
-        height=260,
-        key="voiceover_script_text",
-    )
-
-    # Change request (o4-mini)
-    change_request = voiceover_edit_box.text_area(
-        "Request changes to the voiceover script (handled by o4-mini)",
-        placeholder="e.g., Make it more Pakistan-centric, remove jargon, add one concrete number, tighten the hook.",
-        height=120,
-        key="voiceover_change_request",
-    )
-    col_edit_1, col_edit_2, _ = st.columns([1, 1, 3])
-    apply_changes = col_edit_1.button("Apply changes (o4-mini)", use_container_width=True)
-    reset_voiceover = col_edit_2.button("Reset voiceover to clean-from-generated", use_container_width=True)
-
-    if apply_changes:
-        try:
-            client = get_openai_client(st.session_state.get("openai_api_key"))
-            revised = apply_voiceover_changes_o4mini(client, current_voiceover_text, change_request)
-            st.session_state["voiceover_script_text"] = revised
-            st.session_state["voiceover_change_request"] = ""
-            st.toast("Voiceover script updated", icon="✅")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to apply changes: {e}")
-
-    if reset_voiceover:
-        st.session_state["voiceover_script_text"] = make_clean_voiceover_script(current_script_text)
-        st.session_state["voiceover_change_request"] = ""
-        st.toast("Voiceover script reset", icon="🔄")
-        st.rerun()
-
-    # Downloads
+    # Downloads (script + optional fact report)
     download_buttons_area(current_script_text, topic, facts_payload)
 
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"{ts}-{slugify(topic)}"
-    vo_name = f"{base}-voiceover.txt"
-    st.download_button(
-        "Download voiceover script (.txt)",
-        st.session_state.get("voiceover_script_text", current_voiceover_text),
-        file_name=vo_name,
-        mime="text/plain",
-    )
 
 
     st.subheader("3) Voiceover (ElevenLabs)")
@@ -1688,7 +1593,7 @@ if not clicked and st.session_state.get("has_script"):
                     audio_bytes = eleven_tts(
                         st.session_state["eleven_api_key"],
                         st.session_state["eleven_voice_id"],
-                        (st.session_state.get("voiceover_script_text") or current_script_text or script),
+                        (st.session_state.get("generated_script_text") or current_script_text or script),
                         model_id="eleven_multilingual_v2",
                         **(st.session_state.get("eleven_settings") or {}),
                     )
