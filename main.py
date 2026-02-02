@@ -22,7 +22,7 @@ Auth:
 
 Notes:
 - For GPT-5 models ("gpt-5", "gpt-5-pro"), we use the Responses API and NEVER send `temperature`.
-- HeyGen integration now supports only a **video avatar**:
+- HeyGen integration supports only a **video avatar**:
     * character = {"type": "avatar", "avatar_id": "..."}
 - This version prefers the **HeyGen audio-asset flow**:
     1) Generate MP3 with ElevenLabs (in-memory).
@@ -38,10 +38,9 @@ import re
 import json
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
-from datetime import timedelta
 
 import numpy as np
 import requests
@@ -53,29 +52,14 @@ from openai import OpenAI
 # Simple login/auth (via st.secrets)
 # -------------------------------
 def _get_auth_credentials() -> tuple[Optional[str], Optional[str]]:
-    """
-    Fetch login username/password from st.secrets or env.
-
-    Preferred (Streamlit Cloud / local):
-        .streamlit/secrets.toml
-            APP_USERNAME = "myuser"
-            APP_PASSWORD = "supersecret"
-
-    Fallback:
-        Environment variables APP_USERNAME / APP_PASSWORD
-    """
     user = None
     pwd = None
-
-    # Prefer secrets
     try:
         user = st.secrets.get("APP_USERNAME")  # type: ignore[attr-defined]
         pwd = st.secrets.get("APP_PASSWORD")  # type: ignore[attr-defined]
     except Exception:
-        # st.secrets may not be configured (e.g., local without secrets)
         pass
 
-    # Fallback to env if secrets not set
     if not user:
         user = os.getenv("APP_USERNAME")
     if not pwd:
@@ -85,12 +69,6 @@ def _get_auth_credentials() -> tuple[Optional[str], Optional[str]]:
 
 
 def require_login() -> None:
-    """
-    Simple username/password gate using Streamlit session_state.
-
-    Call this once near the top of the app; if credentials aren't set
-    or login fails, the rest of the app will not run.
-    """
     expected_user, expected_pw = _get_auth_credentials()
 
     if not expected_user or not expected_pw:
@@ -100,7 +78,6 @@ def require_login() -> None:
         )
         st.stop()
 
-    # Already authenticated in this session
     if st.session_state.get("auth_ok"):
         return
 
@@ -115,14 +92,11 @@ def require_login() -> None:
     if submitted:
         if username == expected_user and password == expected_pw:
             st.session_state["auth_ok"] = True
-            # For modern Streamlit:
             st.rerun()
         else:
             st.error("Invalid username or password.")
             st.stop()
-
     else:
-        # Don't show the rest of the app until they submit valid creds
         st.stop()
 
 
@@ -171,28 +145,9 @@ def slugify(s: str) -> str:
 def is_gpt5(model: str) -> bool:
     return model and model.strip().lower().startswith("gpt-5")
 
-# -------------------------------
-# Voiceover script helpers
-# -------------------------------
-# -------------------------------
-# Voiceover script helpers
-# -------------------------------
-REFERENCES_HEADER_RE = re.compile(r"^\s*references\s*:\s*$", re.IGNORECASE)
 
 # -------------------------------
-# Voiceover script helpers (o4-mini only, no fallbacks)
-# -------------------------------
-VOICEOVER_CLEAN_SYS = (
-    "You are an expert voiceover script cleaner.\n"
-    "Task: Convert the input reel script into a clean voiceover script.\n"
-    "Rules:\n"
-    "- Output ONLY the cleaned voiceover script (no titles, no markdown, no notes).\n"
-    "- Remove ALL citations like [1], [2], and remove any References section entirely.\n"
-    "- Remove ALL URLs/domains and any 'Source:' lines.\n"
-)
-
-# -------------------------------
-# Reel script editing (o4-mini)
+# Voiceover/script editing (o4-mini)
 # -------------------------------
 REEL_EDIT_SYS = (
     "You are an expert short-form Instagram reel script editor.\n"
@@ -206,6 +161,91 @@ REEL_EDIT_SYS = (
     "- Keep it punchy and roughly the same length unless the request says otherwise.\n"
     "- Do NOT add a References section or URLs.\n"
 )
+
+
+def _extract_text_from_responses(resp: Any) -> str:
+    def _content_to_text(c: Any) -> str:
+        if isinstance(c, dict):
+            if c.get("type") != "output_text":
+                return ""
+            text_obj = c.get("text")
+            if isinstance(text_obj, dict):
+                val = text_obj.get("value")
+                if isinstance(val, str):
+                    return val
+                return str(val) if val is not None else ""
+            if isinstance(text_obj, str):
+                return text_obj
+            return str(text_obj) if text_obj is not None else ""
+
+        c_type = getattr(c, "type", "")
+        if c_type != "output_text":
+            return ""
+        text_obj = getattr(c, "text", None)
+        if hasattr(text_obj, "value"):
+            val = getattr(text_obj, "value")
+            if isinstance(val, str):
+                return val
+            return str(val) if val is not None else ""
+        if isinstance(text_obj, str):
+            return text_obj
+        if text_obj is not None:
+            return str(text_obj)
+        return ""
+
+    try:
+        output = getattr(resp, "output", None)
+        chunks: List[str] = []
+        if output:
+            for out in output:
+                if hasattr(out, "content"):
+                    content_list = getattr(out, "content") or []
+                elif isinstance(out, dict):
+                    content_list = out.get("content", []) or []
+                else:
+                    content_list = []
+                for c in content_list:
+                    txt = _content_to_text(c)
+                    if txt:
+                        chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
+    except Exception:
+        pass
+
+    try:
+        d = resp.model_dump()  # type: ignore[attr-defined]
+    except Exception:
+        d = resp if isinstance(resp, dict) else None
+
+    if isinstance(d, dict):
+        chunks: List[str] = []
+        output = d.get("output") or []
+        for out in output:
+            content_list = out.get("content", []) or []
+            for c in content_list:
+                txt = _content_to_text(c)
+                if txt:
+                    chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
+
+    try:
+        ot = getattr(resp, "output_text", None)
+        if ot:
+            return str(ot).strip()
+    except Exception:
+        pass
+
+    t = getattr(resp, "text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    if hasattr(resp, "content") and resp.content:
+        return str(resp.content).strip()
+
+    return ""
+
 
 def revise_script_o4mini(client: OpenAI, script: str, change_request: str) -> str:
     resp = client.responses.create(
@@ -231,29 +271,10 @@ def revise_script_o4mini(client: OpenAI, script: str, change_request: str) -> st
     return out
 
 
-
-VOICEOVER_EDIT_SYS = (
-    "You are an expert short-form voiceover script editor.\n"
-    "Given a voiceover script and a change request, rewrite the script accordingly.\n"
-    "Rules:\n"
-    "- Output ONLY the revised voiceover script (no titles, no markdown, no notes).\n"
-    "- Keep it punchy and ~200 words unless the request says otherwise.\n"
-    "- Preserve the existing tone and cadence unless asked.\n"
-    "- Do NOT add sources, URLs, or reference sections.\n"
-)
-
-
-
-
 # -------------------------------
 # Corpus chunking
 # -------------------------------
 def load_and_chunk_corpus_text(raw_text: str) -> List[str]:
-    """
-    Splits the corpus into semantically meaningful chunks:
-    - Break on double newlines and "Script X:" markers
-    - Fuse tiny fragments to keep chunk size reasonable (200–1200 chars)
-    """
     raw = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     parts = re.split(r"(?:\n\s*\n)|(?:^|\n)(?:Script\s*\d+\s*:)", raw)
     parts = [normalize_text(p) for p in parts if normalize_text(p)]
@@ -295,7 +316,7 @@ def load_and_chunk_corpus_text(raw_text: str) -> List[str]:
 
 
 # -------------------------------
-# Embeddings
+# OpenAI + embeddings
 # -------------------------------
 @st.cache_resource(show_spinner=False)
 def get_openai_client(api_key: str | None) -> OpenAI:
@@ -322,8 +343,9 @@ def build_or_load_index_cached(
     file_hash: str,
     embed_model: str,
     raw_text: str,
+    openai_api_key: str,
 ) -> Dict[str, Any]:
-    client = get_openai_client(st.session_state.get("openai_api_key"))
+    client = get_openai_client(openai_api_key)
     chunks = load_and_chunk_corpus_text(raw_text)
     embeddings = embed_texts(client, chunks, embed_model)
     meta = {
@@ -343,10 +365,10 @@ STYLE_SYSTEM_MSG = (
     "You are a concise scriptwriter for short, informative Instagram reels.\n"
     "Your style based on prior examples:\n"
     "- punchy, journalistic lines (1–2 sentences per beat)\n"
-    "- make the first line a strog catchy hook for an instagram reel/vide\n"
+    "- make the first line a strong catchy hook for an instagram reel/video\n"
     "- Pakistan-centric business, culture, tech examples\n"
     "- Stay neutral and positive — never take a stance\n"
-    "- dont include lines like \"this info is not in the sources\" in the final script  \n"
+    "- dont include lines like \"this info is not in the sources\" in the final script\n"
     "- no emojis, no hashtags, no clickbait\n"
     "- keep to ~200 words\n"
     "Produce ONE script only, no extra commentary or titles, no markdown.\n"
@@ -375,149 +397,33 @@ def retrieve_top_k(topic: str, meta: Dict[str, Any], client: OpenAI, embed_model
     return [int(i) for i in idxs]
 
 
-def _extract_text_from_responses(resp: Any) -> str:
-    """
-    Robustly extract assistant text from a Responses API result.
-
-    Supports both Pydantic objects (new SDK) and plain dicts.
-    Looks for output_text blocks and pulls their `text.value` or `text`.
-    """
-    # Helper to pull text from a single content item (object or dict)
-    def _content_to_text(c: Any) -> str:
-        # dict shape
-        if isinstance(c, dict):
-            if c.get("type") != "output_text":
-                return ""
-            text_obj = c.get("text")
-            if isinstance(text_obj, dict):
-                # typical: {"value": "...", "annotations": [...]}
-                val = text_obj.get("value")
-                if isinstance(val, str):
-                    return val
-                return str(val) if val is not None else ""
-            if isinstance(text_obj, str):
-                return text_obj
-            return str(text_obj) if text_obj is not None else ""
-
-        # object shape
-        c_type = getattr(c, "type", "")
-        if c_type != "output_text":
-            return ""
-        text_obj = getattr(c, "text", None)
-        # text_obj might itself have .value
-        if hasattr(text_obj, "value"):
-            val = getattr(text_obj, "value")
-            if isinstance(val, str):
-                return val
-            return str(val) if val is not None else ""
-        if isinstance(text_obj, str):
-            return text_obj
-        if text_obj is not None:
-            return str(text_obj)
-        return ""
-
-    # 1) Try direct attr access: resp.output -> out.content -> content.text
-    try:
-        output = getattr(resp, "output", None)
-        chunks: List[str] = []
-        if output:
-            for out in output:
-                # handle object vs dict for `out`
-                if hasattr(out, "content"):
-                    content_list = getattr(out, "content") or []
-                elif isinstance(out, dict):
-                    content_list = out.get("content", []) or []
-                else:
-                    content_list = []
-                for c in content_list:
-                    txt = _content_to_text(c)
-                    if txt:
-                        chunks.append(txt)
-        if chunks:
-            return "\n".join(chunks).strip()
-    except Exception:
-        pass
-
-    # 2) Try model_dump() if available (Pydantic models)
-    try:
-        d = resp.model_dump()  # type: ignore[attr-defined]
-    except Exception:
-        d = resp if isinstance(resp, dict) else None
-
-    if isinstance(d, dict):
-        chunks: List[str] = []
-        output = d.get("output") or []
-        for out in output:
-            content_list = out.get("content", []) or []
-            for c in content_list:
-                txt = _content_to_text(c)
-                if txt:
-                    chunks.append(txt)
-        if chunks:
-            return "\n".join(chunks).strip()
-
-    # 3) Other fallbacks: output_text, text, content
-    # Some SDK versions expose a simpler aggregate
-    try:
-        ot = getattr(resp, "output_text", None)
-        if ot:
-            return str(ot).strip()
-    except Exception:
-        pass
-
-    t = getattr(resp, "text", None)
-    if isinstance(t, str) and t.strip():
-        return t.strip()
-
-    if hasattr(resp, "content") and resp.content:
-        return str(resp.content).strip()
-
-    return ""
-
-
-
-
 def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+    # Keep GPT-5 branch minimal & stable (avoids SDK/version mismatches)
     if is_gpt5(model):
         resp = client.responses.create(
             model=model,
             input=messages,
-            text={"format": {"type": "text"}, "verbosity": "medium"},
-            reasoning={"effort": "medium", "summary": "auto"},
-            tools=[{
-                "type": "web_search",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "medium",
-            }],
-            store=True,
-            include=["reasoning.encrypted_content", "web_search_call.action.sources"],
+            text={"format": {"type": "text"}},
+            max_output_tokens=900,
         )
         text = _extract_text_from_responses(resp)
         if not text:
             raise RuntimeError("No text content returned by GPT-5 response.")
         return text
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=600,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        resp = client.responses.create(
-            model=model,
-            input=messages,
-            temperature=temperature,
-            max_output_tokens=600,
-        )
-        text = _extract_text_from_responses(resp)
-        if text:
-            return text
-        raise RuntimeError("No text content returned by Responses fallback.")
+    # Non-GPT5: use Chat Completions
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=600,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
+# -------------------------------
+# News helper (web_search via o4-mini)
+# -------------------------------
 def fetch_pakistan_people_news_from_web(
     client: OpenAI,
     *,
@@ -562,7 +468,6 @@ def fetch_pakistan_people_news_from_web(
             "Prefer credible business/tech sources."
         )
 
-    # ✅ IMPORTANT: web_search cannot be used with JSON mode, so keep output as TEXT
     resp = client.responses.create(
         model="o4-mini",
         input=[
@@ -584,12 +489,10 @@ def fetch_pakistan_people_news_from_web(
     if not content:
         return []
 
-    # Parse JSON from the returned text
     data = None
     try:
         data = json.loads(content)
     except Exception:
-        # try to extract the first JSON object from any extra text
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if m:
             try:
@@ -602,26 +505,18 @@ def fetch_pakistan_people_news_from_web(
 
     items = data.get("items") or []
     out: List[Dict[str, str]] = []
-
     for it in items:
         if not isinstance(it, dict):
             continue
-
         name = str(it.get("name") or "").strip()
         headline = str(it.get("headline") or "").strip()
         summary = str(it.get("summary") or "").strip()
         url = str(it.get("url") or "").strip()
         published = str(it.get("published") or "").strip()
-
         if not (name and headline and summary):
             continue
-
-        out.append(
-            {"name": name, "headline": headline, "summary": summary, "url": url, "published": published}
-        )
-
+        out.append({"name": name, "headline": headline, "summary": summary, "url": url, "published": published})
     return out[:max_items]
-
 
 
 # -------------------------------
@@ -630,11 +525,21 @@ def fetch_pakistan_people_news_from_web(
 FACT_EXTRACT_SYS = (
     "You extract atomic, checkable claims from short newsy scripts.\n"
     "Rules:\n"
-    "- Include claims that can be verified online (names, titles, dates, counts, money, rankings, places), but dont mention things like 'this claim cant be verified from sources' in the final script\n"
+    "- Include claims that can be verified online (names, titles, dates, counts, money, rankings, places).\n"
     "- Make claims as self-contained sentences.\n"
     "- 3-10 claims total, focus on the most material ones.\n"
     'Output JSON: {"claims": ["...", "...", ...]}'
 )
+
+FACT_VERIFY_SYS = (
+    "You are a meticulous fact checker. Given (1) a claim and (2) web snippets with sources, decide:\n"
+    "- VERDICT: \"supported\", \"refuted\", or \"uncertain\"\n"
+    "- CORRECTION: if refuted or uncertain, suggest a corrected, precise statement\n"
+    "- CONFIDENCE: 0-1\n"
+    "- CITES: up to 3 URLs\n"
+    'Return JSON: {"verdict":"...", "correction":"...", "confidence":0.0, "citations":["..."]}'
+)
+
 
 def extract_claims(client: OpenAI, model: str, script: str) -> List[str]:
     msg = [{"role": "system", "content": FACT_EXTRACT_SYS}, {"role": "user", "content": script}]
@@ -643,7 +548,7 @@ def extract_claims(client: OpenAI, model: str, script: str) -> List[str]:
             model=model,
             input=msg,
             text={"format": {"type": "json_object"}, "verbosity": "medium"},
-            reasoning={"effort": "medium", "summary": "auto"},
+            max_output_tokens=700,
         )
         content = _extract_text_from_responses(resp)
     else:
@@ -654,7 +559,7 @@ def extract_claims(client: OpenAI, model: str, script: str) -> List[str]:
             response_format={"type": "json_object"},
             max_tokens=600,
         )
-        content = resp.choices[0].message.content
+        content = resp.choices[0].message.content or ""
 
     try:
         data = json.loads(content)
@@ -666,15 +571,6 @@ def extract_claims(client: OpenAI, model: str, script: str) -> List[str]:
     return claims[:10]
 
 
-FACT_VERIFY_SYS = (
-    "You are a meticulous fact checker. Given (1) a claim and (2) web snippets with sources, decide:\n"
-    "- VERDICT: \"supported\", \"refuted\", or \"uncertain\"\n"
-    "- CORRECTION: if refuted or uncertain, suggest a corrected, precise statement\n"
-    "- CONFIDENCE: 0-1\n"
-    "- CITES: up to 3 URLs\n"
-    'Return JSON: {"verdict":"...", "correction":"...", "confidence":0.0, "citations":["..."]}'
-)
-
 def verify_claim(client: OpenAI, model: str, claim: str, evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
     ev_text = "\n\n".join(
         f"- {e.get('title') or ''}\n{e.get('snippet') or ''}\nSource: {e.get('url') or ''}"
@@ -685,12 +581,13 @@ def verify_claim(client: OpenAI, model: str, claim: str, evidence: List[Dict[str
         {"role": "system", "content": FACT_VERIFY_SYS},
         {"role": "user", "content": f"CLAIM:\n{claim}\n\nEVIDENCE SNIPPETS:\n{ev_text}"},
     ]
+
     if is_gpt5(model):
         resp = client.responses.create(
             model=model,
             input=messages,
             text={"format": {"type": "json_object"}, "verbosity": "medium"},
-            reasoning={"effort": "medium", "summary": "auto"},
+            max_output_tokens=450,
         )
         content = _extract_text_from_responses(resp)
     else:
@@ -701,7 +598,7 @@ def verify_claim(client: OpenAI, model: str, claim: str, evidence: List[Dict[str
             max_tokens=300,
             response_format={"type": "json_object"},
         )
-        content = resp.choices[0].message.content
+        content = resp.choices[0].message.content or ""
 
     try:
         out = json.loads(content)
@@ -747,12 +644,12 @@ def apply_corrections_and_citations(
             model=model,
             input=messages,
             text={"format": {"type": "text"}, "verbosity": "medium"},
-            reasoning={"effort": "medium", "summary": "auto"},
+            max_output_tokens=900,
         )
         revised = _extract_text_from_responses(resp)
     else:
         resp = client.chat.completions.create(model=model, messages=messages, temperature=0.2, max_tokens=800)
-        revised = resp.choices[0].message.content.strip()
+        revised = (resp.choices[0].message.content or "").strip()
 
     ordered_urls: List[str] = []
     for d in decisions:
@@ -861,15 +758,6 @@ def _heygen_headers_get(api_key: str) -> Dict[str, str]:
 
 
 def heygen_upload_audio_asset(api_key: str, filename: str, audio_bytes: bytes) -> str:
-    """
-    Upload an MP3 to HeyGen Assets.
-
-    Correct endpoint & format:
-      POST https://upload.heygen.com/v1/asset
-      Headers: X-Api-Key, Content-Type: audio/mpeg
-      Body: raw bytes (NOT multipart)
-    Returns the created audio asset id.
-    """
     url = "https://upload.heygen.com/v1/asset"
     headers = {
         "X-Api-Key": api_key,
@@ -889,9 +777,6 @@ def heygen_upload_audio_asset(api_key: str, filename: str, audio_bytes: bytes) -
 
 
 def heygen_get_avatar_details(api_key: str, avatar_id: str) -> dict:
-    """
-    Optional preflight to validate a VIDEO avatar id is accessible in this account/workspace.
-    """
     r = requests.get(
         f"{HEYGEN_BASE_V2}/avatar/{avatar_id}/details",
         headers=_heygen_headers_get(api_key),
@@ -914,12 +799,8 @@ def heygen_generate_video(
     height: int = 720,
     background_color: Optional[str] = None,
 ) -> str:
-    """
-    Generate a HeyGen video using ONLY a standard video avatar (Avatar IV disabled).
-    """
     if not (audio_asset_id or audio_url):
         raise ValueError("Provide either audio_asset_id or audio_url for HeyGen voice.")
-
     if not avatar_id:
         raise ValueError("Provide avatar_id (video avatar). Talking-photo (Avatar IV) is disabled in this build.")
 
@@ -937,7 +818,12 @@ def heygen_generate_video(
 
     payload = {"video_inputs": [video_input], "dimension": {"width": width, "height": height}}
 
-    r = requests.post(f"{HEYGEN_BASE_V2}/video/generate", headers=_heygen_headers_json(api_key), data=json.dumps(payload), timeout=60)
+    r = requests.post(
+        f"{HEYGEN_BASE_V2}/video/generate",
+        headers=_heygen_headers_json(api_key),
+        data=json.dumps(payload),
+        timeout=60,
+    )
     if r.status_code != 200:
         raise RuntimeError(f"HeyGen video generation failed: {r.status_code}\n{r.text}")
     data = r.json() or {}
@@ -973,22 +859,26 @@ st.set_page_config(page_title="Reel Script Generator", page_icon="🎬", layout=
 require_login()
 
 st.title("🎬 Reel Script Generator")
-st.caption("Generate scripts, voice them with ElevenLabs, then upload MP3 to HeyGen Assets and render the avatar video (video avatars only — Avatar IV disabled).")
+st.caption(
+    "Generate scripts, voice them with ElevenLabs, then upload MP3 to HeyGen Assets and render the avatar video "
+    "(video avatars only — Avatar IV disabled)."
+)
 
 # Sidebar: keys & settings
 with st.sidebar:
     st.header("Settings")
 
-    # Optional logout
     if st.session_state.get("auth_ok"):
         if st.button("Logout"):
             st.session_state.clear()
-            st.experimental_rerun()
+            st.rerun()
 
     openai_api_key = st.text_input("OPENAI_API_KEY", value=os.getenv("OPENAI_API_KEY", ""), type="password")
     st.session_state["openai_api_key"] = openai_api_key
 
-    tavily_api_key = st.text_input("TAVILY_API_KEY (optional; for Fact Check)", value=TAVILY_API_KEY_ENV or "", type="password")
+    tavily_api_key = st.text_input(
+        "TAVILY_API_KEY (optional; for Fact Check)", value=TAVILY_API_KEY_ENV or "", type="password"
+    )
     st.session_state["tavily_api_key"] = tavily_api_key
 
     st.divider()
@@ -1001,18 +891,16 @@ with st.sidebar:
     is_g5 = is_gpt5(gen_model)
     temperature = st.slider("Temperature", 0.0, 1.2, 0.7, 0.1, disabled=is_g5)
     if is_g5:
-        st.caption("Note: GPT-5 ignores temperature. Using Responses API with reasoning & web_search tool.")
+        st.caption("Note: GPT-5 ignores temperature. Using Responses API (minimal stable call).")
 
     st.divider()
     k = st.slider("Top-k retrieved chunks", 1, 20, 15)
-
     max_ctx_chars = st.number_input("Max context characters", min_value=500, max_value=20000, value=6000, step=100)
 
     st.divider()
     fact_check = st.toggle("Enable Fact Checking", value=False)
     citations = st.toggle("Add inline citations & references", value=True, disabled=not fact_check)
     max_claims = st.slider("Max claims to check", 1, 10, 8, disabled=not fact_check)
-    force_search_refresh = st.toggle("Force fresh web search", value=False, disabled=not fact_check)
 
     st.divider()
     # --- ElevenLabs UI ---
@@ -1057,21 +945,20 @@ with st.sidebar:
     st.session_state["heygen_api_key"] = heygen_api_key
 
     st.caption("Select a VIDEO avatar (avatar_id). Talking-photo (Avatar IV) is disabled in this build.")
-    avatar_id_input = st.text_input("HeyGen AVATAR ID (video avatar)", value="d53434113ef240969f03d1fd376176e0", placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf")
+    avatar_id_input = st.text_input(
+        "HeyGen AVATAR ID (video avatar)",
+        value="d53434113ef240969f03d1fd376176e0",
+        placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf",
+    )
     st.session_state["avatar_id_input"] = avatar_id_input.strip()
-
-    engine = "Video Avatar (Avatar IV disabled)"
-    st.caption(f"Engine: {engine}")
 
     heygen_width = st.number_input("Video Width", min_value=320, max_value=1920, value=1280, step=10)
     heygen_height = st.number_input("Video Height", min_value=240, max_value=1080, value=720, step=10)
     heygen_bg = st.text_input("Background color (hex, optional)", value="#000000")
 
-    # (Optional) If you already have an audio asset id or a public URL, you can paste it here.
     audio_asset_id_input = st.text_input("Use existing HeyGen audio_asset_id (optional)", value="")
     audio_url_input = st.text_input("Or use a public audio_url (optional)", value="", placeholder="https://.../voiceover.mp3")
 
-    # Persist UI state
     st.session_state.update(
         {
             "heygen_width": heygen_width,
@@ -1082,9 +969,9 @@ with st.sidebar:
         }
     )
 
-# Early key tip
 if not st.session_state.get("openai_api_key"):
     st.info("Add your OPENAI_API_KEY in the sidebar to begin.")
+
 
 # -------------------------------
 # 1) Corpus from repo (scripts.txt)
@@ -1100,16 +987,17 @@ if corpus_path.exists():
         raw_text = corpus_path.read_text(encoding="utf-8", errors="ignore")
         source_label = f"repo:{corpus_path.name}"
         file_hash = sha256_bytes(raw_text.encode("utf-8"))
-        st.success(
-            f"Loaded corpus from `{corpus_path.name}` • {len(raw_text):,} characters • hash {file_hash[:8]}…"
-        )
+        st.success(f"Loaded corpus from `{corpus_path.name}` • {len(raw_text):,} characters • hash {file_hash[:8]}…")
         with st.spinner("Building embeddings index (cached by corpus+model)…"):
             try:
-                meta = build_or_load_index_cached(file_hash=file_hash, embed_model=embed_model, raw_text=raw_text)
-                st.session_state["meta"] = meta
-                st.caption(
-                    f"Indexed {len(meta['chunks'])} chunks • model {meta['model']} • built {meta['built_at']}"
+                meta = build_or_load_index_cached(
+                    file_hash=file_hash,
+                    embed_model=embed_model,
+                    raw_text=raw_text,
+                    openai_api_key=st.session_state.get("openai_api_key", ""),
                 )
+                st.session_state["meta"] = meta
+                st.caption(f"Indexed {len(meta['chunks'])} chunks • model {meta['model']} • built {meta['built_at']}")
             except Exception as e:
                 st.error(f"Failed to build/load index: {e}")
     except Exception as e:
@@ -1117,34 +1005,21 @@ if corpus_path.exists():
 else:
     st.error("Could not find `scripts.txt` in the app directory. Add it to the repo to proceed.")
 
+
 # -------------------------------
 # 2) Generate a script
 # -------------------------------
 st.subheader("2) Generate a script")
 
-# Mode selector
-mode = st.radio(
-    "Choose input for script",
-    ["Type a topic", "Find news"],
-    horizontal=True,
-    key="script_input_mode",
-)
+mode = st.radio("Choose input for script", ["Type a topic", "Find news"], horizontal=True, key="script_input_mode")
 
 topic = ""
 
-# ---- MODE A: manual topic ----
 if mode == "Type a topic":
-    topic = st.text_input(
-        "Topic",
-        placeholder="e.g., Pakistan's fintech wave in 2025",
-        key="topic_input",
-    )
-
-# ---- MODE B: news -> select one ----
+    topic = st.text_input("Topic", placeholder="e.g., Pakistan's fintech wave in 2025", key="topic_input")
 else:
     st.caption("Search recent Pakistani founders/creators news, select one item, then generate a script from it.")
 
-    # Controls for web news finder
     cA, cB, cC = st.columns([1, 1, 2])
     st.session_state["news_kind"] = cA.radio(
         "Type",
@@ -1152,7 +1027,6 @@ else:
         index=0 if st.session_state.get("news_kind", "Creators") == "Creators" else 1,
         key="news_kind_radio",
     )
-
     st.session_state["news_range"] = cB.selectbox(
         "Date range",
         ["One day", "One week", "One month", "3 months", "6 months", "One year"],
@@ -1161,7 +1035,6 @@ else:
         ),
         key="news_range_select",
     )
-
     st.session_state["news_name_filter"] = cC.text_input(
         "Name filter (optional)",
         value=st.session_state.get("news_name_filter", ""),
@@ -1169,18 +1042,15 @@ else:
         key="news_name_filter_input",
     )
 
-    # Buttons row
     colg = st.columns([1, 1, 3])
     suggest_btn = colg[0].button("Find news", use_container_width=True)
-    refresh_note = colg[1].toggle("Auto-refresh when changing filters", value=False, key="news_autorefresh")
+    autorefresh = colg[1].toggle("Auto-refresh when changing filters", value=False, key="news_autorefresh")
 
-    # Optional auto-refresh: rerun search when filters change
-    if refresh_note:
-        # create a simple signature of filters
+    if autorefresh:
         sig = f"{st.session_state['news_kind']}|{st.session_state['news_range']}|{st.session_state['news_name_filter']}"
         if st.session_state.get("news_filter_sig") != sig:
             st.session_state["news_filter_sig"] = sig
-            suggest_btn = True  # trigger fetch
+            suggest_btn = True
 
     if suggest_btn:
         if not st.session_state.get("openai_api_key"):
@@ -1239,30 +1109,21 @@ else:
             if chosen.get("url"):
                 st.markdown(f"**Source:** {chosen.get('url')}")
 
-            # This becomes the "topic" used for generation
             headline = (chosen.get("headline") or "").strip()
             summary = (chosen.get("summary") or "").strip()
             url = (chosen.get("url") or "").strip()
 
-            # Make topic richer than just headline (helps model stay anchored)
             topic = headline
             if summary:
                 topic += f" — {summary}"
             if url:
                 topic += f" (Source: {url})"
 
-# Shared Generate button (works for BOTH modes)
 colg2 = st.columns([1, 4])
 clicked = colg2[0].button("Generate script", type="primary", use_container_width=True)
 
-
-# Output containers
-# Output containers
 script_box = st.empty()
 facts_expander = st.expander("Fact-check results", expanded=False)
-
-
-
 
 
 def download_buttons_area(text: str, topic: str, facts_payload: Dict[str, Any] | None):
@@ -1279,13 +1140,39 @@ def download_buttons_area(text: str, topic: str, facts_payload: Dict[str, Any] |
             mime="application/json",
         )
 
+
+def on_apply_script_changes():
+    if not st.session_state.get("openai_api_key"):
+        st.session_state["edit_error"] = "Add your OPENAI_API_KEY in the sidebar to apply changes."
+        return
+
+    try:
+        client = get_openai_client(st.session_state.get("openai_api_key"))
+        revised = revise_script_o4mini(
+            client,
+            st.session_state.get("generated_script_text", ""),
+            st.session_state.get("script_edit_request", ""),
+        )
+
+        st.session_state["last_script"] = revised
+        st.session_state["generated_script_text"] = revised
+        st.session_state["script_edit_request"] = ""
+
+        st.session_state.pop("audio_bytes", None)
+        st.session_state.pop("heygen_video_url", None)
+        st.session_state.pop("edit_error", None)
+    except Exception as e:
+        st.session_state["edit_error"] = f"Edit failed: {e}"
+
+
+# -------------------------------
+# Generate flow (this is what was broken before due to indentation)
+# -------------------------------
 if clicked and not topic:
     st.warning("Please enter a topic or select a news item first.")
     st.stop()
 
-
 if clicked and topic and st.session_state.get("meta"):
-    # Retrieval
     client = get_openai_client(st.session_state.get("openai_api_key"))
     meta = st.session_state["meta"]
 
@@ -1301,7 +1188,6 @@ if clicked and topic and st.session_state.get("meta"):
         if not retrieved and top:
             retrieved.append(meta["chunks"][top[0]])
 
-
     with st.spinner("Generating script…"):
         messages = make_prompt(topic, retrieved)
         try:
@@ -1312,20 +1198,20 @@ if clicked and topic and st.session_state.get("meta"):
             st.error(f"Generation failed: {e}")
             st.stop()
 
-    # Optional fact checking
     bibliography: List[str] = []
     facts_payload: Dict[str, Any] | None = None
+
     if fact_check:
         if not (st.session_state.get("tavily_api_key") or TAVILY_API_KEY_ENV):
             st.warning("Enable Fact Checking requires TAVILY_API_KEY in the sidebar.")
         else:
             st.toast("Fact checking enabled", icon="🔎")
-            # Claim extraction
             try:
-                claims = extract_claims(client, gen_model, script)[: max_claims]
+                claims = extract_claims(client, gen_model, script)[:max_claims]
             except Exception as e:
                 st.error(f"Claim extraction failed: {e}")
                 claims = []
+
             if claims:
                 facts_table_rows = []
                 progress = st.progress(0.0, text="Verifying claims…")
@@ -1361,15 +1247,31 @@ if clicked and topic and st.session_state.get("meta"):
                         evidence = tavily_search(c)
                         decision = verify_claim(client, gen_model, c, evidence)
                     except Exception as e:
-                        decision = {"claim": c, "verdict": "error", "correction": str(e), "confidence": 0.0, "citations": []}
+                        decision = {
+                            "claim": c,
+                            "verdict": "error",
+                            "correction": str(e),
+                            "confidence": 0.0,
+                            "citations": [],
+                        }
                     decisions.append(decision)
                     cites = ", ".join(decision.get("citations", [])[:2]) or "—"
-                    facts_table_rows.append({"#": i, "Claim": c, "Verdict": decision.get("verdict", ""), "Confidence": f"{decision.get('confidence', 0):.2f}", "Citations": cites})
+                    facts_table_rows.append(
+                        {
+                            "#": i,
+                            "Claim": c,
+                            "Verdict": decision.get("verdict", ""),
+                            "Confidence": f"{decision.get('confidence', 0):.2f}",
+                            "Citations": cites,
+                        }
+                    )
                     progress.progress(i / len(claims))
                 progress.empty()
 
                 try:
-                    script, bibliography = apply_corrections_and_citations(client, gen_model, script, decisions, add_inline_citations=citations)
+                    script, bibliography = apply_corrections_and_citations(
+                        client, gen_model, script, decisions, add_inline_citations=citations
+                    )
                 except Exception as e:
                     st.warning(f"Could not auto-apply corrections: {e}")
 
@@ -1390,224 +1292,55 @@ if clicked and topic and st.session_state.get("meta"):
                         for i, url in enumerate(bibliography, start=1):
                             st.markdown(f"[{i}] {url}")
 
-    
-    
-    
+    # Persist results for reruns
     st.session_state.update(
-    {
-        "has_script": True,
-        "last_script": script,
-        "last_topic": topic,
-        "last_facts_payload": facts_payload,
-    }
+        {
+            "has_script": True,
+            "last_script": script,
+            "last_topic": topic,
+            "last_facts_payload": facts_payload,
+        }
+    )
 
-
-)
-
-def on_apply_script_changes():
-    if not st.session_state.get("openai_api_key"):
-        st.session_state["edit_error"] = "Add your OPENAI_API_KEY in the sidebar to apply changes."
-        return
-
-    try:
-        client = get_openai_client(st.session_state.get("openai_api_key"))
-
-        revised = revise_script_o4mini(
-            client,
-            st.session_state.get("generated_script_text", ""),
-            st.session_state.get("script_edit_request", ""),
-        )
-
-        # ✅ SAFE: this runs before widgets are created
-        st.session_state["last_script"] = revised
-        st.session_state["generated_script_text"] = revised
-        st.session_state["script_edit_request"] = ""
-
-        # invalidate downstream assets
-        st.session_state.pop("audio_bytes", None)
-        st.session_state.pop("heygen_video_url", None)
-
-        st.session_state.pop("edit_error", None)
-
-    except Exception as e:
-        st.session_state["edit_error"] = f"Edit failed: {e}"
-
-
-  
-    # Box: Generated script (may include citations/references if fact-checking enabled)
+    # ✅ SHOW THE SCRIPT UI (this was the broken indentation in your old file)
     current_script_text = script_box.text_area(
         "Generated script",
         value=script,
         height=320,
         key="generated_script_text",
     )
-    
-    #
-    st.subheader("2b) Revise the generated script")
 
-    edit_request = st.text_area(
+    st.subheader("2b) Revise the generated script")
+    st.text_area(
         "Ask for changes",
         placeholder="e.g., Make it more conversational, cut it to ~160 words, add one line about X, keep Pakistan angle.",
         key="script_edit_request",
         height=100,
     )
-
-    
     st.button(
-    "Apply changes (o4-mini)",
-    use_container_width=True,
-    disabled=not st.session_state.get("script_edit_request", "").strip(),
-    on_click=on_apply_script_changes,
-)
+        "Apply changes (o4-mini)",
+        use_container_width=True,
+        disabled=not st.session_state.get("script_edit_request", "").strip(),
+        on_click=on_apply_script_changes,
+    )
     if st.session_state.get("edit_error"):
         st.error(st.session_state["edit_error"])
 
-
-
     st.caption("Tip: If Fact Checking + citations is enabled, it may include [n] markers and a References section.")
-
-    # Downloads
     download_buttons_area(current_script_text, topic, facts_payload)
 
-
-
-    # -------------------------------
-    # 3) Voiceover (ElevenLabs)
-    # -------------------------------
-    st.subheader("3) Voiceover (ElevenLabs)")
-    if not st.session_state.get("eleven_api_key"):
-        st.info("Add ELEVENLABS_API_KEY in the sidebar to enable audio generation.")
-    elif not st.session_state.get("eleven_voice_id"):
-        st.warning("Select a voice in the sidebar.")
-    else:
-        c1, c2, _ = st.columns([1, 1, 2])
-        make_audio = c1.button("Generate Audio", type="primary", use_container_width=True)
-        regen_audio = c2.button("Regenerate", use_container_width=True)
-        do_tts = make_audio or regen_audio
-        tts_text = (
-            st.session_state.get("generated_script_text")
-            or current_script_text
-            or script
-        )
-
-
-
-        if do_tts:
-            try:
-                with st.spinner("Generating voiceover…"):
-                    audio_bytes = eleven_tts(
-                        st.session_state["eleven_api_key"],
-                        st.session_state["eleven_voice_id"],
-                        tts_text,
-                        model_id="eleven_multilingual_v2",
-                        **(st.session_state.get("eleven_settings") or {}),
-                    )
-                st.session_state["audio_bytes"] = audio_bytes
-                st.session_state.pop("heygen_video_url", None)
-                st.toast("Audio ready", icon="🔊")
-            except Exception as e:
-                st.error(f"Audio generation failed: {e}")
-
-        if st.session_state.get("audio_bytes"):
-            st.audio(st.session_state["audio_bytes"], format="audio/mpeg")
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            base = f"{ts}-{slugify(topic)}"
-            mp3_name = f"{base}.mp3"
-            st.download_button("Download audio (.mp3)", st.session_state["audio_bytes"], file_name=mp3_name, mime="audio/mpeg", use_container_width=True)
-        else:
-            st.caption("No audio yet. Generate to preview.")
-
-    # -------------------------------
-    # 4) Video (HeyGen) — upload MP3 to HeyGen, then render with audio_asset_id
-    # -------------------------------
-    st.subheader("4) Render Video (HeyGen)")
-    if not st.session_state.get("heygen_api_key"):
-        st.info("Add HEYGEN_API_KEY in the sidebar to enable video rendering.")
-    else:
-        colv1, colv2, _ = st.columns([1, 1, 2])
-        btn_render = colv1.button("Upload MP3 to HeyGen & Make Video", type="primary", use_container_width=True)
-        btn_rerender = colv2.button("Re-render (reuse inputs)", use_container_width=True)
-
-        if btn_render or btn_rerender:
-            # Priority order for audio:
-            # 1) user-provided audio_asset_id
-            # 2) user-provided audio_url
-            # 3) generated ElevenLabs audio_bytes -> upload to HeyGen Assets
-            chosen_asset_id = (st.session_state.get("audio_asset_id_input") or "").strip()
-            chosen_audio_url = (st.session_state.get("audio_url_input") or "").strip()
-
-            if not chosen_asset_id and not chosen_audio_url:
-                if not st.session_state.get("audio_bytes"):
-                    st.error("No ElevenLabs audio found. Generate audio first, or paste an existing HeyGen audio_asset_id / public audio_url.")
-                else:
-                    try:
-                        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                        filename = f"{slugify(topic) or 'voiceover'}-{ts}.mp3"
-                        with st.spinner("Uploading MP3 to HeyGen Assets…"):
-                            chosen_asset_id = heygen_upload_audio_asset(
-                                st.session_state["heygen_api_key"],
-                                filename,
-                                st.session_state["audio_bytes"],
-                            )
-                        st.toast(f"Uploaded to HeyGen Assets (asset_id: {chosen_asset_id[:8]}…)", icon="⬆️")
-                    except Exception as e:
-                        st.error(f"HeyGen audio upload failed: {e}")
-
-            # Character selection (video avatar only)
-            avatar_id = st.session_state.get("avatar_id_input")
-
-            try:
-                # Preflight for VIDEO avatars
-                if avatar_id:
-                    heygen_get_avatar_details(st.session_state["heygen_api_key"], avatar_id)
-                else:
-                    st.error("Please provide a HeyGen AVATAR ID (video avatar).")
-                    st.stop()
-
-                with st.spinner("Starting HeyGen video generation…"):
-                    video_id = heygen_generate_video(
-                        st.session_state["heygen_api_key"],
-                        avatar_id=avatar_id or None,
-                        audio_asset_id=chosen_asset_id or None,
-                        audio_url=chosen_audio_url or None,
-                        width=int(st.session_state["heygen_width"]),
-                        height=int(st.session_state["heygen_height"]),
-                        background_color=(st.session_state["heygen_bg"] or "").strip() or None,
-                    )
-
-                with st.spinner("Waiting for HeyGen to finish…"):
-                    final_status = heygen_wait_for_video(
-                        st.session_state["heygen_api_key"],
-                        video_id,
-                        poll_seconds=5,
-                        timeout_seconds=900,
-                    )
-                video_url = (final_status.get("data", {}) or {}).get("video_url") or final_status.get("video_url")
-                if not video_url:
-                    raise RuntimeError(f"No video_url found in final status: {json.dumps(final_status, indent=2)}")
-                st.session_state["heygen_video_url"] = video_url
-                st.toast("HeyGen video ready", icon="🎬")
-            except Exception as e:
-                st.error(f"HeyGen rendering failed: {e}")
-
-        if st.session_state.get("heygen_video_url"):
-            st.video(st.session_state["heygen_video_url"])
-            st.link_button("Open video in new tab", st.session_state["heygen_video_url"], use_container_width=True)
-        else:
-            st.caption("No HeyGen video yet. Render to preview.")
-
-if clicked and not topic:
-    st.warning("Enter a topic first.")
 if clicked and not st.session_state.get("meta"):
     st.warning("Corpus index not ready. Ensure `scripts.txt` is present and index built successfully.")
 
+
+# -------------------------------
 # If user didn't click this run, keep previous results available (so buttons work after rerun)
-if not clicked and st.session_state.get("has_script"):
+# -------------------------------
+if (not clicked) and st.session_state.get("has_script"):
     script = st.session_state.get("last_script", "")
     topic = st.session_state.get("last_topic", "")
     facts_payload = st.session_state.get("last_facts_payload")
 
-    # ONLY show the generated script box
     current_script_text = script_box.text_area(
         "Generated script",
         value=script,
@@ -1615,134 +1348,149 @@ if not clicked and st.session_state.get("has_script"):
         key="generated_script_text",
     )
 
-    #
     st.subheader("2b) Revise the generated script")
-
-    edit_request = st.text_area(
+    st.text_area(
         "Ask for changes",
         placeholder="e.g., Make it more conversational, cut it to ~160 words, add one line about X.",
         key="script_edit_request",
         height=100,
     )
-
     st.button(
-    "Apply changes (o4-mini)",
-    use_container_width=True,
-    disabled=not st.session_state.get("script_edit_request", "").strip(),
-    on_click=on_apply_script_changes,
-)
+        "Apply changes (o4-mini)",
+        use_container_width=True,
+        disabled=not st.session_state.get("script_edit_request", "").strip(),
+        on_click=on_apply_script_changes,
+    )
     if st.session_state.get("edit_error"):
         st.error(st.session_state["edit_error"])
 
-            
-
-
-    # Downloads (script + optional fact report)
     download_buttons_area(current_script_text, topic, facts_payload)
 
+# -------------------------------
+# 3) Voiceover (ElevenLabs)
+# -------------------------------
+st.subheader("3) Voiceover (ElevenLabs)")
+if not st.session_state.get("has_script"):
+    st.info("Generate a script first.")
+elif not st.session_state.get("eleven_api_key"):
+    st.info("Add ELEVENLABS_API_KEY in the sidebar to enable audio generation.")
+elif not st.session_state.get("eleven_voice_id"):
+    st.warning("Select a voice in the sidebar.")
+else:
+    c1, c2, _ = st.columns([1, 1, 2])
+    make_audio = c1.button("Generate Audio", type="primary", use_container_width=True)
+    regen_audio = c2.button("Regenerate", use_container_width=True)
+    do_tts = make_audio or regen_audio
 
+    tts_text = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
+    topic_for_files = st.session_state.get("last_topic") or "voiceover"
 
-    st.subheader("3) Voiceover (ElevenLabs)")
-    if not st.session_state.get("eleven_api_key"):
-        st.info("Add ELEVENLABS_API_KEY in the sidebar to enable audio generation.")
-    elif not st.session_state.get("eleven_voice_id"):
-        st.warning("Select a voice in the sidebar.")
+    if do_tts:
+        try:
+            with st.spinner("Generating voiceover…"):
+                audio_bytes = eleven_tts(
+                    st.session_state["eleven_api_key"],
+                    st.session_state["eleven_voice_id"],
+                    tts_text,
+                    model_id="eleven_multilingual_v2",
+                    **(st.session_state.get("eleven_settings") or {}),
+                )
+            st.session_state["audio_bytes"] = audio_bytes
+            st.session_state.pop("heygen_video_url", None)
+            st.toast("Audio ready", icon="🔊")
+        except Exception as e:
+            st.error(f"Audio generation failed: {e}")
+
+    if st.session_state.get("audio_bytes"):
+        st.audio(st.session_state["audio_bytes"], format="audio/mpeg")
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"{ts}-{slugify(topic_for_files)}"
+        mp3_name = f"{base}.mp3"
+        st.download_button(
+            "Download audio (.mp3)",
+            st.session_state["audio_bytes"],
+            file_name=mp3_name,
+            mime="audio/mpeg",
+            use_container_width=True,
+        )
     else:
-        c1, c2, _ = st.columns([1, 1, 2])
-        make_audio = c1.button("Generate Audio", type="primary", use_container_width=True)
-        regen_audio = c2.button("Regenerate", use_container_width=True)
+        st.caption("No audio yet. Generate to preview.")
 
-        if make_audio or regen_audio:
-            try:
-                with st.spinner("Generating voiceover…"):
-                    audio_bytes = eleven_tts(
-                        st.session_state["eleven_api_key"],
-                        st.session_state["eleven_voice_id"],
-                        (st.session_state.get("generated_script_text") or current_script_text or script),
-                        model_id="eleven_multilingual_v2",
-                        **(st.session_state.get("eleven_settings") or {}),
-                    )
-                st.session_state["audio_bytes"] = audio_bytes
-                st.session_state.pop("heygen_video_url", None)
-                st.toast("Audio ready", icon="🔊")
-            except Exception as e:
-                st.error(f"Audio generation failed: {e}")
+# -------------------------------
+# 4) Video (HeyGen)
+# -------------------------------
+st.subheader("4) Render Video (HeyGen)")
+if not st.session_state.get("has_script"):
+    st.info("Generate a script first.")
+elif not st.session_state.get("heygen_api_key"):
+    st.info("Add HEYGEN_API_KEY in the sidebar to enable video rendering.")
+else:
+    colv1, colv2, _ = st.columns([1, 1, 2])
+    btn_render = colv1.button("Upload MP3 to HeyGen & Make Video", type="primary", use_container_width=True)
+    btn_rerender = colv2.button("Re-render (reuse inputs)", use_container_width=True)
 
-        if st.session_state.get("audio_bytes"):
-            st.audio(st.session_state["audio_bytes"], format="audio/mpeg")
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            base = f"{ts}-{slugify(topic)}"
-            mp3_name = f"{base}.mp3"
-            st.download_button("Download audio (.mp3)", st.session_state["audio_bytes"], file_name=mp3_name, mime="audio/mpeg", use_container_width=True)
-        else:
-            st.caption("No audio yet. Generate to preview.")
+    if btn_render or btn_rerender:
+        chosen_asset_id = (st.session_state.get("audio_asset_id_input") or "").strip()
+        chosen_audio_url = (st.session_state.get("audio_url_input") or "").strip()
 
-    st.subheader("4) Render Video (HeyGen)")
-    if not st.session_state.get("heygen_api_key"):
-        st.info("Add HEYGEN_API_KEY in the sidebar to enable video rendering.")
+        topic_for_files = st.session_state.get("last_topic") or "video"
+
+        if not chosen_asset_id and not chosen_audio_url:
+            if not st.session_state.get("audio_bytes"):
+                st.error("No ElevenLabs audio found. Generate audio first, or paste an existing HeyGen audio_asset_id / public audio_url.")
+            else:
+                try:
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    filename = f"{slugify(topic_for_files) or 'voiceover'}-{ts}.mp3"
+                    with st.spinner("Uploading MP3 to HeyGen Assets…"):
+                        chosen_asset_id = heygen_upload_audio_asset(
+                            st.session_state["heygen_api_key"],
+                            filename,
+                            st.session_state["audio_bytes"],
+                        )
+                    st.toast(f"Uploaded to HeyGen Assets (asset_id: {chosen_asset_id[:8]}…)", icon="⬆️")
+                except Exception as e:
+                    st.error(f"HeyGen audio upload failed: {e}")
+
+        avatar_id = st.session_state.get("avatar_id_input")
+
+        try:
+            if avatar_id:
+                heygen_get_avatar_details(st.session_state["heygen_api_key"], avatar_id)
+            else:
+                st.error("Please provide a HeyGen AVATAR ID (video avatar).")
+                st.stop()
+
+            with st.spinner("Starting HeyGen video generation…"):
+                video_id = heygen_generate_video(
+                    st.session_state["heygen_api_key"],
+                    avatar_id=avatar_id or None,
+                    audio_asset_id=chosen_asset_id or None,
+                    audio_url=chosen_audio_url or None,
+                    width=int(st.session_state["heygen_width"]),
+                    height=int(st.session_state["heygen_height"]),
+                    background_color=(st.session_state["heygen_bg"] or "").strip() or None,
+                )
+
+            with st.spinner("Waiting for HeyGen to finish…"):
+                final_status = heygen_wait_for_video(
+                    st.session_state["heygen_api_key"],
+                    video_id,
+                    poll_seconds=5,
+                    timeout_seconds=900,
+                )
+
+            video_url = (final_status.get("data", {}) or {}).get("video_url") or final_status.get("video_url")
+            if not video_url:
+                raise RuntimeError(f"No video_url found in final status: {json.dumps(final_status, indent=2)}")
+
+            st.session_state["heygen_video_url"] = video_url
+            st.toast("HeyGen video ready", icon="🎬")
+        except Exception as e:
+            st.error(f"HeyGen rendering failed: {e}")
+
+    if st.session_state.get("heygen_video_url"):
+        st.video(st.session_state["heygen_video_url"])
+        st.link_button("Open video in new tab", st.session_state["heygen_video_url"], use_container_width=True)
     else:
-        colv1, colv2, _ = st.columns([1, 1, 2])
-        btn_render = colv1.button("Upload MP3 to HeyGen & Make Video", type="primary", use_container_width=True)
-        btn_rerender = colv2.button("Re-render (reuse inputs)", use_container_width=True)
-
-        if btn_render or btn_rerender:
-            chosen_asset_id = (st.session_state.get("audio_asset_id_input") or "").strip()
-            chosen_audio_url = (st.session_state.get("audio_url_input") or "").strip()
-
-            if not chosen_asset_id and not chosen_audio_url:
-                if not st.session_state.get("audio_bytes"):
-                    st.error("No ElevenLabs audio found. Generate audio first, or paste an existing HeyGen audio_asset_id / public audio_url.")
-                else:
-                    try:
-                        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                        filename = f"{slugify(topic) or 'voiceover'}-{ts}.mp3"
-                        with st.spinner("Uploading MP3 to HeyGen Assets…"):
-                            chosen_asset_id = heygen_upload_audio_asset(
-                                st.session_state["heygen_api_key"],
-                                filename,
-                                st.session_state["audio_bytes"],
-                            )
-                        st.toast(f"Uploaded to HeyGen Assets (asset_id: {chosen_asset_id[:8]}…)", icon="⬆️")
-                    except Exception as e:
-                        st.error(f"HeyGen audio upload failed: {e}")
-
-            avatar_id = st.session_state.get("avatar_id_input")
-
-            try:
-                if avatar_id:
-                    heygen_get_avatar_details(st.session_state["heygen_api_key"], avatar_id)
-                else:
-                    st.error("Please provide a HeyGen AVATAR ID (video avatar).")
-                    st.stop()
-
-                with st.spinner("Starting HeyGen video generation…"):
-                    video_id = heygen_generate_video(
-                        st.session_state["heygen_api_key"],
-                        avatar_id=avatar_id or None,
-                        audio_asset_id=chosen_asset_id or None,
-                        audio_url=chosen_audio_url or None,
-                        width=int(st.session_state["heygen_width"]),
-                        height=int(st.session_state["heygen_height"]),
-                        background_color=(st.session_state["heygen_bg"] or "").strip() or None,
-                    )
-
-                with st.spinner("Waiting for HeyGen to finish…"):
-                    final_status = heygen_wait_for_video(
-                        st.session_state["heygen_api_key"],
-                        video_id,
-                        poll_seconds=5,
-                        timeout_seconds=900,
-                    )
-                video_url = (final_status.get("data", {}) or {}).get("video_url") or final_status.get("video_url")
-                if not video_url:
-                    raise RuntimeError(f"No video_url found in final status: {json.dumps(final_status, indent=2)}")
-                st.session_state["heygen_video_url"] = video_url
-                st.toast("HeyGen video ready", icon="🎬")
-            except Exception as e:
-                st.error(f"HeyGen rendering failed: {e}")
-
-        if st.session_state.get("heygen_video_url"):
-            st.video(st.session_state["heygen_video_url"])
-            st.link_button("Open video in new tab", st.session_state["heygen_video_url"], use_container_width=True)
-        else:
-            st.caption("No HeyGen video yet. Render to preview.")
+        st.caption("No HeyGen video yet. Render to preview.")
