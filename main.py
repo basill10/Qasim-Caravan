@@ -104,7 +104,7 @@ def require_login() -> None:
 # Defaults / Config
 # -------------------------------
 DEFAULT_EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
-DEFAULT_GEN_MODEL = os.getenv("GEN_MODEL", "gpt-5.2")
+DEFAULT_GEN_MODEL = os.getenv("GEN_MODEL", "gpt-5")
 DEFAULT_VECTOR_STORE_DIR = Path(os.getenv("VECTOR_STORE_DIR", ".vector_store"))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
