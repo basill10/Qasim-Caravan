@@ -174,14 +174,23 @@ def is_gpt5(model: str) -> bool:
 # -------------------------------
 # Voiceover script helpers
 # -------------------------------
+# -------------------------------
+# Voiceover script helpers
+# -------------------------------
 REFERENCES_HEADER_RE = re.compile(r"^\s*references\s*:\s*$", re.IGNORECASE)
+
+# Common domain TLDs you’ll see in citations
+_DOMAIN_TLDS = r"(?:com|pk|org|net|io|co|gov|edu|info|tv|me)"
 
 def make_clean_voiceover_script(script_with_sources: str) -> str:
     """
     Create a 'clean' voiceover script from the generated script:
     - Removes trailing References section (and anything after it)
-    - Removes bare URLs
     - Removes inline citation markers like [1], [2] (keeps the text)
+    - Removes URLs (http/https)
+    - Removes markdown links like ([site](url)) AND broken forms like ([site](
+    - Removes bare domains in parentheses/brackets like (gritdaily.com) or [gritdaily.com]
+    - Removes common "Source:" lines
     """
     if not script_with_sources:
         return ""
@@ -199,17 +208,50 @@ def make_clean_voiceover_script(script_with_sources: str) -> str:
 
     text = "\n".join(lines)
 
-    # 2) Remove inline [n] markers
+    # 2) Remove inline [n] markers (citations), but keep the text
     text = re.sub(r"\[(\d{1,3})\]", "", text)
 
-    # 3) Remove URLs anywhere
+    # 3) Remove full markdown links: ([label](url)) or [label](url)
+    text = re.sub(r"\(\s*\[[^\]]+\]\([^)]+\)\s*\)", "", text)   # wrapped in parens
+    text = re.sub(r"\[[^\]]+\]\([^)]+\)", "", text)            # not wrapped
+
+    # 4) Remove broken/incomplete markdown links to end-of-line: ([gritdaily.com](
+    text = re.sub(r"\(\s*\[[^\]]+\]\([^\n]*", "", text)
+    text = re.sub(r"\[[^\]]+\]\([^\n]*", "", text)
+
+    # 5) Remove bare URLs anywhere
     text = re.sub(r"https?://\S+", "", text)
 
-    # 4) Clean whitespace
+    # 6) Remove "Source: ..." lines/fragments
+    text = re.sub(r"(?im)^\s*source\s*:\s*\S+\s*$", "", text)
+
+    # 7) Remove bare domains in parentheses: (gritdaily.com) / (www.site.pk/foo)
+    text = re.sub(
+        rf"\(\s*(?:www\.)?[a-z0-9.-]+\.{_DOMAIN_TLDS}(?:/[^\s)]*)?\s*\)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 8) Remove bare domains in brackets: [gritdaily.com]
+    text = re.sub(
+        rf"\[\s*(?:www\.)?[a-z0-9.-]+\.{_DOMAIN_TLDS}(?:/[^\s\]]*)?\s*\]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 9) Clean leftover whitespace/punctuation gaps
     text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\s+\.", ".", text)          # " ." -> "."
+    text = re.sub(r"\(\s*\)", "", text)         # remove empty ()
+    text = re.sub(r"\[\s*\]", "", text)         # remove empty []
+    text = re.sub(r"\s{2,}", " ", text)         # collapse repeated spaces (within lines)
+    text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
     return text
+
 
 
 VOICEOVER_EDIT_SYS = (
