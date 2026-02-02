@@ -1049,74 +1049,38 @@ else:
 # -------------------------------
 st.subheader("2) Generate a script")
 
-topic = st.text_input("Topic", placeholder="e.g., Pakistan's fintech wave in 2025", key="topic_input")
+# Mode selector
+mode = st.radio(
+    "Choose input for script",
+    ["Type a topic", "Find news"],
+    horizontal=True,
+    key="script_input_mode",
+)
 
-colg = st.columns([1, 1, 2, 2])
-clicked = colg[0].button("Generate", type="primary", use_container_width=True)
+topic = ""
 
-# NEW: button to fetch Pakistan story ideas from web
-suggest_btn = colg[1].button("Find news", use_container_width=True)
+# ---- MODE A: manual topic ----
+if mode == "Type a topic":
+    topic = st.text_input(
+        "Topic",
+        placeholder="e.g., Pakistan's fintech wave in 2025",
+        key="topic_input",
+    )
 
-if suggest_btn:
-    if not st.session_state.get("openai_api_key"):
-        st.error("Add your OPENAI_API_KEY in the sidebar to fetch news.")
-    else:
-        try:
-            client = get_openai_client(st.session_state.get("openai_api_key"))
+# ---- MODE B: news -> select one ----
+else:
+    st.caption("Search recent Pakistani founders/creators news, select one item, then generate a script from it.")
 
-            # Initialize defaults if missing
-            if "news_kind" not in st.session_state:
-                st.session_state["news_kind"] = "Creators"
-            if "news_range" not in st.session_state:
-                st.session_state["news_range"] = "One week"
-            if "news_name_filter" not in st.session_state:
-                st.session_state["news_name_filter"] = ""
-
-            kind_ui = st.session_state["news_kind"]
-            range_ui = st.session_state["news_range"]
-            name_filter = st.session_state["news_name_filter"]
-
-            days_map = {
-                "One day": 1,
-                "One week": 7,
-                "One month": 30,
-                "3 months": 90,
-                "6 months": 180,
-                "One year": 365,
-            }
-            days_back = days_map.get(range_ui, 7)
-
-            kind_key = "creators" if kind_ui.lower().startswith("creator") else "founders"
-
-            with st.spinner("Searching the web…"):
-                items = fetch_pakistan_people_news_from_web(
-                    client,
-                    kind=kind_key,
-                    days_back=days_back,
-                    name_filter=name_filter,
-                    max_items=8,
-                )
-                if not items:
-                    st.warning("Web search returned no items. Try widening the date range or removing the name filter.")
-
-
-            st.session_state["web_news_items"] = items
-            st.toast("Loaded news from web", icon="📰")
-
-        except Exception as e:
-            st.error(f"Fetching news failed: {e}")
-
-
-# Controls + results for web news finder
-with st.expander("Find Pakistani founders / creators (web)", expanded=False):
-    st.session_state["news_kind"] = st.radio(
-        "Choose type",
+    # Controls for web news finder
+    cA, cB, cC = st.columns([1, 1, 2])
+    st.session_state["news_kind"] = cA.radio(
+        "Type",
         ["Creators", "Founders"],
         index=0 if st.session_state.get("news_kind", "Creators") == "Creators" else 1,
         key="news_kind_radio",
     )
 
-    st.session_state["news_range"] = st.selectbox(
+    st.session_state["news_range"] = cB.selectbox(
         "Date range",
         ["One day", "One week", "One month", "3 months", "6 months", "One year"],
         index=["One day", "One week", "One month", "3 months", "6 months", "One year"].index(
@@ -1125,32 +1089,74 @@ with st.expander("Find Pakistani founders / creators (web)", expanded=False):
         key="news_range_select",
     )
 
-    st.session_state["news_name_filter"] = st.text_input(
+    st.session_state["news_name_filter"] = cC.text_input(
         "Name filter (optional)",
         value=st.session_state.get("news_name_filter", ""),
         placeholder="e.g., 'Mooroo' or 'Monis Rahman'",
         key="news_name_filter_input",
     )
 
-    st.caption("Tip: Click **Find news** above after setting filters.")
+    # Buttons row
+    colg = st.columns([1, 1, 3])
+    suggest_btn = colg[0].button("Find news", use_container_width=True)
+    refresh_note = colg[1].toggle("Auto-refresh when changing filters", value=False, key="news_autorefresh")
+
+    # Optional auto-refresh: rerun search when filters change
+    if refresh_note:
+        # create a simple signature of filters
+        sig = f"{st.session_state['news_kind']}|{st.session_state['news_range']}|{st.session_state['news_name_filter']}"
+        if st.session_state.get("news_filter_sig") != sig:
+            st.session_state["news_filter_sig"] = sig
+            suggest_btn = True  # trigger fetch
+
+    if suggest_btn:
+        if not st.session_state.get("openai_api_key"):
+            st.error("Add your OPENAI_API_KEY in the sidebar to fetch news.")
+        else:
+            try:
+                client = get_openai_client(st.session_state.get("openai_api_key"))
+
+                days_map = {
+                    "One day": 1,
+                    "One week": 7,
+                    "One month": 30,
+                    "3 months": 90,
+                    "6 months": 180,
+                    "One year": 365,
+                }
+                days_back = days_map.get(st.session_state["news_range"], 7)
+                kind_key = "creators" if st.session_state["news_kind"].lower().startswith("creator") else "founders"
+
+                with st.spinner("Searching the web…"):
+                    items = fetch_pakistan_people_news_from_web(
+                        client,
+                        kind=kind_key,
+                        days_back=days_back,
+                        name_filter=st.session_state.get("news_name_filter", ""),
+                        max_items=8,
+                    )
+
+                if not items:
+                    st.warning("No items found. Try widening the date range or removing the name filter.")
+                st.session_state["web_news_items"] = items
+                st.toast("Loaded news from web", icon="📰")
+
+            except Exception as e:
+                st.error(f"Fetching news failed: {e}")
 
     items = st.session_state.get("web_news_items") or []
     if not items:
-        st.info("No results yet. Set filters here, then click **Find news**.")
+        st.info("Click **Find news** to load results.")
     else:
-        # Show selection + details
-        labels = [
-            f"{it.get('name','')} — {it.get('headline','')}"[:140]
-            for it in items
-        ]
+        labels = [f"{it.get('name','')} — {it.get('headline','')}"[:160] for it in items]
         selected_idx = st.radio(
-            "Pick one result",
+            "Select one story",
             list(range(len(labels))),
             format_func=lambda i: labels[i],
             key="web_news_pick_radio",
         )
-
         chosen = items[selected_idx] if 0 <= selected_idx < len(items) else None
+
         if chosen:
             st.markdown(f"**Name:** {chosen.get('name','')}")
             st.markdown(f"**Headline:** {chosen.get('headline','')}")
@@ -1160,15 +1166,26 @@ with st.expander("Find Pakistani founders / creators (web)", expanded=False):
             if chosen.get("url"):
                 st.markdown(f"**Source:** {chosen.get('url')}")
 
-            use_as_topic = st.button("Use selected headline as Topic", key="use_news_headline_as_topic_btn")
-            if use_as_topic and chosen.get("headline"):
-                st.session_state["topic_input"] = chosen["headline"]
-                st.experimental_rerun()
+            # This becomes the "topic" used for generation
+            headline = (chosen.get("headline") or "").strip()
+            summary = (chosen.get("summary") or "").strip()
+            url = (chosen.get("url") or "").strip()
 
+            # Make topic richer than just headline (helps model stay anchored)
+            topic = headline
+            if summary:
+                topic += f" — {summary}"
+            if url:
+                topic += f" (Source: {url})"
+
+# Shared Generate button (works for BOTH modes)
+colg2 = st.columns([1, 4])
+clicked = colg2[0].button("Generate script", type="primary", use_container_width=True)
 
 # Output containers
 script_box = st.empty()
 facts_expander = st.expander("Fact-check results", expanded=False)
+
 
 
 def download_buttons_area(text: str, topic: str, facts_payload: Dict[str, Any] | None):
@@ -1184,6 +1201,11 @@ def download_buttons_area(text: str, topic: str, facts_payload: Dict[str, Any] |
             file_name=json_name,
             mime="application/json",
         )
+
+if clicked and not topic:
+    st.warning("Please enter a topic or select a news item first.")
+    st.stop()
+
 
 if clicked and topic and st.session_state.get("meta"):
     # Retrieval
