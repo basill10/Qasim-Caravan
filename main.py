@@ -388,7 +388,8 @@ Constraints:
             "user_location": {"type": "approximate"},
             "search_context_size": "medium",
         }],
-        text={"format": {"type": "json_object"}, "verbosity": "medium"},
+        text={"format": {"type": "text"}, "verbosity": "medium"},
+
         max_output_tokens=900,
         store=False,
     )
