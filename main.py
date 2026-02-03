@@ -432,8 +432,13 @@ Constraints:
             raw = str(resp)
 
     data = _safe_json_load(raw) or {}
+
     if not isinstance(data, dict):
         data = {}
+    
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        items = []
 
     with st.expander("🔎 Debug: raw Find News output", expanded=False):
         st.code(raw or "(empty)")
@@ -1451,6 +1456,7 @@ if clicked_news:
             except Exception as e:
                 st.error(f"Find News failed: {e}")
                 items = []
+                debug = {"error": str(e)}
 
         st.session_state["last_news_items"] = items
         st.session_state["last_news_mode"] = news_mode
