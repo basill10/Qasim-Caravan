@@ -424,24 +424,21 @@ Constraints:
         store=False,
     )
 
-    raw = _extract_text_from_responses(resp)
+    raw = _extract_text_from_responses(resp) or getattr(resp, "output_text", "") or ""
     if not raw:
-        raw = getattr(resp, "output_text", "") or ""
-    if not raw:
-    # last resort: dump the whole response for debugging
         try:
             raw = json.dumps(resp.model_dump(), ensure_ascii=False)
         except Exception:
             raw = str(resp)
+
+    data = _safe_json_load(raw) or {}
+    if not isinstance(data, dict):
+        data = {}
+
     with st.expander("🔎 Debug: raw Find News output", expanded=False):
         st.code(raw or "(empty)")
-        st.write("Parsed keys:", list(data.keys()) if isinstance(data, dict) else type(data))
-    
+        st.write("Parsed keys:", list(data.keys()))
 
-    data = _safe_json_load(raw)
-    items = data.get("items") or []
-    if not isinstance(items, list):
-        return []
 
     # Normalize + minimal validation
     out: list[dict] = []
@@ -1444,7 +1441,7 @@ if clicked_news:
         client = get_openai_client(st.session_state.get("openai_api_key"))
         with st.spinner("Searching the web for news…"):
             try:
-                items = find_news(
+                items, debug = find_news(
                     client,
                     mode=news_mode,
                     date_range_label=news_range,
@@ -1459,6 +1456,7 @@ if clicked_news:
         st.session_state["last_news_mode"] = news_mode
         st.session_state["last_news_range"] = news_range
         st.session_state["last_news_name"] = news_name
+        st.session_state["last_news_debug"] = debug
 
         with news_box:
             st.subheader(f"📰 News results — {news_mode} ({news_range})")
