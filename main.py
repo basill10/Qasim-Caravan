@@ -341,7 +341,7 @@ NEWS_SYS = (
     "- Summaries must be 1–2 sentences.\n"
 )
 
-def find_news_o4mini(
+def find_news(
     client: OpenAI,
     *,
     mode: str,  # "Creators" or "Founders"
@@ -350,7 +350,7 @@ def find_news_o4mini(
     max_items: int = 10,
 ) -> tuple[list[dict], dict]:
     """
-    Fetches uplifting/positive recent news about Pakistani creators or founders using web_search via o4-mini.
+    Fetches uplifting/positive recent news about Pakistani creators or founders using web_search via gpt.
     Returns list of items with: name, headline, summary, url, published.
     """
     start_date, end_date = _date_range_from_option(date_range_label)
@@ -407,7 +407,7 @@ Constraints:
 """.strip()
 
     resp = client.responses.create(
-        model="o4-mini",
+        model="gpt-5.2",
         input=[
             {"role": "system", "content": NEWS_SYS},
             {"role": "user", "content": user_prompt},
@@ -418,7 +418,7 @@ Constraints:
             "search_context_size": "medium",
         }],
         text={"format": {"type": "text"}, "verbosity": "medium"},
-        
+
         max_output_tokens=2400,
         include=["web_search_call.action.sources"],
         store=False,
@@ -1444,7 +1444,7 @@ if clicked_news:
         client = get_openai_client(st.session_state.get("openai_api_key"))
         with st.spinner("Searching the web for news…"):
             try:
-                items = find_news_o4mini(
+                items = find_news(
                     client,
                     mode=news_mode,
                     date_range_label=news_range,
