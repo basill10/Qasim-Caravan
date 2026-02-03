@@ -418,8 +418,9 @@ Constraints:
             "search_context_size": "medium",
         }],
         text={"format": {"type": "text"}, "verbosity": "medium"},
-
-        max_output_tokens=900,
+        
+        max_output_tokens=2400,
+        include=["web_search_call.action.sources"],
         store=False,
     )
 
