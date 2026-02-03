@@ -46,6 +46,7 @@ import numpy as np
 import requests
 import streamlit as st
 from openai import OpenAI
+from datetime import datetime, timedelta
 
 
 # -------------------------------
@@ -170,6 +171,49 @@ def slugify(s: str) -> str:
 def is_gpt5(model: str) -> bool:
     return model and model.strip().lower().startswith("gpt-5")
 
+def _date_range_from_option(opt: str) -> tuple[str, str]:
+    """
+    Returns ISO date strings (YYYY-MM-DD) for (start_date, end_date) based on a UI option.
+    End date is inclusive (today).
+    """
+    today = datetime.now().date()
+
+    mapping = {
+        "One day": 1,
+        "One week": 7,
+        "One month": 30,
+        "3 months": 90,
+        "6 months": 180,
+        "One year": 365,
+    }
+    days = mapping.get(opt, 30)
+    start = today - timedelta(days=days)
+    return start.isoformat(), today.isoformat()
+
+
+def _safe_json_load(s: str) -> dict:
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        return {}
+
+
+def _looks_unsafe_creators_text(t: str) -> bool:
+    """
+    Basic post-filter for creators news to avoid harmful/explicit/deepfake scandal content.
+    Not perfect, but helps catch mistakes.
+    """
+    bad = [
+        "deepfake", "porn", "pornography", "explicit", "sex", "sexual", "nude", "nudity",
+        "onlyfans", "leak", "leaked", "scandal", "harassment", "assault", "rape",
+        "gore", "violent", "suicide", "self-harm",
+    ]
+    x = (t or "").lower()
+    return any(b in x for b in bad)
+
 
 # -------------------------------
 # Corpus chunking
@@ -260,6 +304,132 @@ def build_or_load_index_cached(
         "built_at": datetime.utcnow().isoformat() + "Z",
     }
     return meta
+NEWS_SYS = (
+    "You are a web research assistant. Return ONLY valid JSON.\n"
+    "Rules:\n"
+    "- Only include real, recent news you found on the web.\n"
+    "- Do not hallucinate.\n"
+    "- Summaries must be 1–2 sentences.\n"
+)
+
+def find_news_o4mini(
+    client: OpenAI,
+    *,
+    mode: str,  # "Creators" or "Founders"
+    date_range_label: str,
+    name_filter: str = "",
+    max_items: int = 10,
+) -> list[dict]:
+    """
+    Fetches uplifting/positive recent news about Pakistani creators or founders using web_search via o4-mini.
+    Returns list of items with: name, headline, summary, url, published.
+    """
+    start_date, end_date = _date_range_from_option(date_range_label)
+
+    # Build a query that nudges the web tool toward the requested timeframe.
+    # (Web search tools don't always guarantee date filtering, so we enforce in instructions too.)
+    base_query = "Pakistan" if not name_filter.strip() else f"Pakistan {name_filter.strip()}"
+
+    if mode == "Creators":
+        query = (
+            f"{base_query} YouTuber OR \"content creator\" OR influencer "
+            f"positive OR educational OR inspiring news {start_date}..{end_date}"
+        )
+        extra_rules = (
+            "Only include positive, educational, or uplifting news.\n"
+            "Do NOT include any 18+ content, deepfake scandals, or harmful/explicit material.\n"
+        )
+        who = "Pakistani YouTubers and internet personalities"
+    else:
+        query = (
+            f"{base_query} founder OR startup founder OR entrepreneur "
+            f"funding OR award OR expansion OR partnership news {start_date}..{end_date}"
+        )
+        extra_rules = ""
+        who = "Pakistani founders"
+
+    user_prompt = f"""
+Task: Search the web for recent news on {who}.
+
+DATE RANGE: {start_date} to {end_date} (inclusive). If a result has no clear date, include it only if it is obviously within this range.
+
+{extra_rules}
+
+If a name filter is provided, prioritize results about that person: "{name_filter.strip()}"
+
+Return JSON with this schema:
+{{
+  "items": [
+    {{
+      "name": "Full name",
+      "headline": "News headline",
+      "summary": "1-2 sentence summary",
+      "url": "Source URL",
+      "published": "YYYY-MM-DD or empty string"
+    }}
+  ]
+}}
+
+Constraints:
+- Items must be about Pakistani {mode.lower()} (or clearly Pakistan-based).
+- Avoid duplicates.
+- Prefer credible sources (major news sites, reputable business/tech outlets, official announcements).
+- Return at most {max_items} items.
+""".strip()
+
+    resp = client.responses.create(
+        model="o4-mini",
+        input=[
+            {"role": "system", "content": NEWS_SYS},
+            {"role": "user", "content": user_prompt},
+        ],
+        tools=[{
+            "type": "web_search",
+            "user_location": {"type": "approximate"},
+            "search_context_size": "medium",
+        }],
+        text={"format": {"type": "json_object"}, "verbosity": "medium"},
+        max_output_tokens=900,
+        store=False,
+    )
+
+    raw = _extract_text_from_responses(resp)
+    data = _safe_json_load(raw)
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return []
+
+    # Normalize + minimal validation
+    out: list[dict] = []
+    for it in items[:max_items]:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("name") or "").strip()
+        headline = (it.get("headline") or "").strip()
+        summary = (it.get("summary") or "").strip()
+        url = (it.get("url") or "").strip()
+        published = (it.get("published") or "").strip()
+
+        if not name or not headline or not summary:
+            continue
+
+        # Post-filter creators for safety (belt + suspenders)
+        if mode == "Creators":
+            combo = f"{name} {headline} {summary}"
+            if _looks_unsafe_creators_text(combo):
+                continue
+
+        out.append(
+            {
+                "Name": name,
+                "Headline": headline,
+                "Summary": summary,
+                "Published": published,
+                "URL": url,
+            }
+        )
+
+    return out
 
 
 # -------------------------------
@@ -444,73 +614,8 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         raise RuntimeError("No text content returned by Responses fallback.")
 
 
-# -------- NEW: story ideas from web (Pakistan) --------
-def fetch_story_ideas_from_web(client: OpenAI, model: str, max_ideas: int = 5) -> List[str]:
-    """
-    Use GPT + web_search to propose concise, reel-ready story ideas
-    about current, factual developments in Pakistan.
-    """
 
-    system_msg = (
-        "You are a Pakistan-based news researcher for Instagram reels.\n"
-        "You propose concise, reel-worthy story titles about recent, factual developments "
-        "in Pakistan's business, tech, culture, or economy that can be reported on.\n"
-        "Each idea should be:\n"
-        "- grounded in real, verifiable events (use web search)\n"
-        "- neutral, factual, non-clickbait\n"
-        "- at most 15 words\n"
-        "- suitable as a reel topic title (no numbering, no emojis, no hashtags).\n"
-        "Return ONLY a single JSON object of the form:\n"
-        "    {\"ideas\": [\"...\", \"...\"]}\n"
-        "No extra commentary or formatting."
-    )
 
-    user_msg = f"Generate {max_ideas} distinct story titles."
-
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        text={
-            "format": {"type": "text"},  # MUST be text when using web_search
-            "verbosity": "medium",
-        },
-        reasoning={"effort": "medium", "summary": "auto"},
-        tools=[
-            {
-                "type": "web_search",
-                "user_location": {"type": "approximate", "country": "PK"},
-                "search_context_size": "medium",
-            }
-        ],
-        store=True,
-        include=[
-            "reasoning.encrypted_content",
-            "web_search_call.action.sources",
-        ],
-        max_output_tokens=400,
-    )
-
-    content = _extract_text_from_responses(resp)
-    if not content:
-        raise RuntimeError("Empty response when fetching story ideas.")
-
-    # Parse JSON out of the text
-    try:
-        data = json.loads(content)
-    except Exception:
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if not m:
-            raise RuntimeError(f"Could not parse JSON from story ideas: {content!r}")
-        data = json.loads(m.group(0))
-
-    ideas = [i.strip() for i in data.get("ideas", []) if isinstance(i, str) and i.strip()]
-    if not ideas:
-        raise RuntimeError(f"No ideas found in parsed result: {data!r}")
-
-    return ideas[:max_ideas]
 
 
 
@@ -1016,45 +1121,28 @@ st.subheader("2) Generate a script")
 
 topic = st.text_input("Topic", placeholder="e.g., Pakistan's fintech wave in 2025", key="topic_input")
 
+# --- News controls ---
+news_col1, news_col2, news_col3 = st.columns([1.2, 1.2, 1.6])
+news_mode = news_col1.selectbox("Find News for", ["Creators", "Founders"], index=0)
+news_range = news_col2.selectbox(
+    "Date range",
+    ["One day", "One week", "One month", "3 months", "6 months", "One year"],
+    index=2,
+)
+news_name = news_col3.text_input("Name of founder/creator (optional)", value="", placeholder="e.g., Mooroo, Irfan Junejo, Jehan Ara…")
+
 colg = st.columns([1, 1, 2, 2])
 clicked = colg[0].button("Generate", type="primary", use_container_width=True)
+clicked_news = colg[1].button("Find News", use_container_width=True)
 
-# NEW: button to fetch Pakistan story ideas from web
-suggest_btn = colg[1].button("Find ideas", use_container_width=True)
 
-if suggest_btn:
-    if not st.session_state.get("openai_api_key"):
-        st.error("Add your OPENAI_API_KEY in the sidebar to fetch story ideas.")
-    else:
-        try:
-            client = get_openai_client(st.session_state.get("openai_api_key"))
-            with st.spinner("Looking up fresh Pakistan stories…"):
-                ideas = fetch_story_ideas_from_web(client, gen_model, max_ideas=5)
-            if not ideas:
-                st.warning("Could not find story ideas. Try again in a bit.")
-            else:
-                st.session_state["web_story_ideas"] = ideas
-                st.toast("Loaded story ideas from web", icon="📰")
-        except Exception as e:
-            st.error(f"Fetching story ideas failed: {e}")
 
-# Show ideas (if any) and allow user to auto-fill Topic
-if st.session_state.get("web_story_ideas"):
-    with st.expander("Story ideas from Pakistan news", expanded=True):
-        choice = st.radio(
-            "Pick a story idea to auto-fill Topic",
-            st.session_state["web_story_ideas"],
-            key="story_idea_radio",
-        )
-        use_idea = st.button("Use selected idea as Topic", key="use_story_idea_btn")
-        if use_idea and choice:
-            st.session_state["topic_input"] = choice
-            # Rerun so the updated topic shows in the text_input
-            st.experimental_rerun()
 
 # Output containers
 script_box = st.empty()
+news_box = st.container()
 facts_expander = st.expander("Fact-check results", expanded=False)
+
 
 
 def download_buttons_area(text: str, topic: str, facts_payload: Dict[str, Any] | None):
@@ -1304,10 +1392,59 @@ if clicked and topic and st.session_state.get("meta"):
         else:
             st.caption("No HeyGen video yet. Render to preview.")
 
+if clicked_news:
+    if not st.session_state.get("openai_api_key"):
+        st.error("Add your OPENAI_API_KEY in the sidebar to use Find News.")
+    else:
+        client = get_openai_client(st.session_state.get("openai_api_key"))
+        with st.spinner("Searching the web for news…"):
+            try:
+                items = find_news_o4mini(
+                    client,
+                    mode=news_mode,
+                    date_range_label=news_range,
+                    name_filter=news_name,
+                    max_items=10,
+                )
+            except Exception as e:
+                st.error(f"Find News failed: {e}")
+                items = []
+
+        st.session_state["last_news_items"] = items
+        st.session_state["last_news_mode"] = news_mode
+        st.session_state["last_news_range"] = news_range
+        st.session_state["last_news_name"] = news_name
+
+        with news_box:
+            st.subheader(f"📰 News results — {news_mode} ({news_range})")
+            if news_name.strip():
+                st.caption(f"Filter: {news_name.strip()}")
+            if not items:
+                st.info("No matching results found for the selected range.")
+            else:
+                st.dataframe(items, use_container_width=True, hide_index=True)
+
+
 elif clicked and not topic:
     st.warning("Enter a topic first.")
 elif clicked and not st.session_state.get("meta"):
     st.warning("Corpus index not ready. Ensure `scripts.txt` is present and index built successfully.")
+
+
+if not clicked_news and st.session_state.get("last_news_items"):
+    with news_box:
+        nm = st.session_state.get("last_news_mode", "Creators")
+        nr = st.session_state.get("last_news_range", "One month")
+        nn = st.session_state.get("last_news_name", "")
+        st.subheader(f"📰 News results — {nm} ({nr})")
+        if nn.strip():
+            st.caption(f"Filter: {nn.strip()}")
+        st.dataframe(
+            st.session_state["last_news_items"],
+            use_container_width=True,
+            hide_index=True
+        )
+
 
 # If user didn't click this run, keep previous results available (so buttons work after rerun)
 if not clicked and st.session_state.get("has_script"):
