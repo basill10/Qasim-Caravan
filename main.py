@@ -348,7 +348,7 @@ def find_news_o4mini(
     date_range_label: str,
     name_filter: str = "",
     max_items: int = 10,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """
     Fetches uplifting/positive recent news about Pakistani creators or founders using web_search via o4-mini.
     Returns list of items with: name, headline, summary, url, published.
@@ -424,9 +424,18 @@ Constraints:
     )
 
     raw = _extract_text_from_responses(resp)
+    if not raw:
+        raw = getattr(resp, "output_text", "") or ""
+    if not raw:
+    # last resort: dump the whole response for debugging
+        try:
+            raw = json.dumps(resp.model_dump(), ensure_ascii=False)
+        except Exception:
+            raw = str(resp)
     with st.expander("🔎 Debug: raw Find News output", expanded=False):
         st.code(raw or "(empty)")
         st.write("Parsed keys:", list(data.keys()) if isinstance(data, dict) else type(data))
+    
 
     data = _safe_json_load(raw)
     items = data.get("items") or []
@@ -463,7 +472,7 @@ Constraints:
             }
         )
 
-    return out
+    return out, {"raw": raw, "data": data}
 
 
 # -------------------------------
@@ -516,12 +525,12 @@ def _extract_text_from_responses(resp: Any) -> str:
     def _content_to_text(c: Any) -> str:
         # dict shape
         if isinstance(c, dict):
-            if c.get("type") != "output_text":
+            ctype = c.get("type")
+            if ctype not in ("output_text", "text"):
                 return ""
             text_obj = c.get("text")
             if isinstance(text_obj, dict):
-                # typical: {"value": "...", "annotations": [...]}
-                val = text_obj.get("value")
+                val = text_obj.get("value") or text_obj.get("text")
                 if isinstance(val, str):
                     return val
                 return str(val) if val is not None else ""
@@ -529,9 +538,10 @@ def _extract_text_from_responses(resp: Any) -> str:
                 return text_obj
             return str(text_obj) if text_obj is not None else ""
 
+
         # object shape
         c_type = getattr(c, "type", "")
-        if c_type != "output_text":
+        if c_type not in ("output_text", "text"):
             return ""
         text_obj = getattr(c, "text", None)
         # text_obj might itself have .value
