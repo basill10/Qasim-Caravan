@@ -1228,6 +1228,22 @@ def set_script_state(*, script: str, topic: str, facts_payload: dict | None):
         }
     )
 
+def download_buttons_area(text: str, topic: str, facts_payload: dict | None):
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{ts}-{slugify(topic)}"
+    txt_name = f"{base}.txt"
+    st.download_button("Download script (.txt)", text, file_name=txt_name, mime="text/plain")
+
+    if facts_payload is not None:
+        json_name = f"{base}-facts.json"
+        st.download_button(
+            "Download fact report (.json)",
+            json.dumps(facts_payload, ensure_ascii=False, indent=2),
+            file_name=json_name,
+            mime="application/json",
+        )
+
+
 def render_script_editor_once():
     """
     The ONLY place in the app that renders the text_area with key='generated_script_text'.
