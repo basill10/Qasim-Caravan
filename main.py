@@ -171,6 +171,44 @@ def slugify(s: str) -> str:
 def is_gpt5(model: str) -> bool:
     return model and model.strip().lower().startswith("gpt-5")
 
+def _news_item_label(it: dict, idx: int) -> str:
+    name = (it.get("Name") or "").strip()
+    headline = (it.get("Headline") or "").strip()
+    published = (it.get("Published") or "").strip()
+    pub = f" — {published}" if published else ""
+    who = f"{name}: " if name else ""
+    return f"{idx+1}. {who}{headline}{pub}"
+
+def _news_item_anchor(it: dict) -> str:
+    # Compact, script-safe “fact anchor”
+    name = (it.get("Name") or "").strip()
+    headline = (it.get("Headline") or "").strip()
+    summary = (it.get("Summary") or "").strip()
+    published = (it.get("Published") or "").strip()
+    url = (it.get("URL") or "").strip()
+
+    lines = []
+    if headline:
+        lines.append(f"Headline: {headline}")
+    if name:
+        lines.append(f"Person/Org: {name}")
+    if published:
+        lines.append(f"Date: {published}")
+    if summary:
+        lines.append(f"Summary: {summary}")
+    if url:
+        lines.append(f"Source: {url}")
+    return "\n".join(lines).strip()
+
+def _news_item_topic(it: dict) -> str:
+    # This becomes the “topic” string used for retrieval similarity & naming outputs
+    name = (it.get("Name") or "").strip()
+    headline = (it.get("Headline") or "").strip()
+    if name and headline:
+        return f"{name} — {headline}"
+    return headline or name or "Selected news story"
+
+
 def _date_range_from_option(opt: str) -> tuple[str, str]:
     """
     Returns ISO date strings (YYYY-MM-DD) for (start_date, end_date) based on a UI option.
@@ -495,18 +533,32 @@ STYLE_SYSTEM_MSG = (
 )
 
 
-def make_prompt(topic: str, retrieved_chunks: List[str]) -> List[Dict[str, str]]:
+def make_prompt(topic: str, retrieved_chunks: List[str], news_anchor: str | None = None) -> List[Dict[str, str]]:
     context_block = "\n\n--- EXCERPTED STYLE/CONTENT SAMPLES ---\n" + "\n\n".join(retrieved_chunks)
+
+    anchor_block = ""
+    if news_anchor:
+        anchor_block = (
+            "\n\n--- SELECTED NEWS ITEM (FACT ANCHOR) ---\n"
+            f"{news_anchor}\n"
+            "\nRules for the selected news item:\n"
+            "- Build the reel around THIS specific item.\n"
+            "- Do not invent facts beyond what's in the anchor.\n"
+            "- If you add context, keep it general and non-claimy (no numbers/dates unless in anchor).\n"
+            "- Do not mention 'sources' or 'fact anchor' in the script.\n"
+        )
+
     user_msg = f"""Topic: {topic}
 
 Using the style learned from the samples below (structure, cadence, sentence length, and tone), write a new script tailored to the topic. Avoid copying lines verbatim. Prefer locally relevant angles (Pakistan when applicable), concrete numbers, and short paragraph beats.
-
+{anchor_block}
 {context_block}
 """
     return [
         {"role": "system", "content": STYLE_SYSTEM_MSG},
         {"role": "user", "content": user_msg},
     ]
+
 
 
 def retrieve_top_k(topic: str, meta: Dict[str, Any], client: OpenAI, embed_model: str, k: int = 15) -> List[int]:
@@ -1472,6 +1524,73 @@ if clicked_news:
                 st.info("No matching results found for the selected range.")
             else:
                 st.dataframe(items, use_container_width=True, hide_index=True)
+                                # --- NEW: pick one item and generate a script from it ---
+                st.divider()
+                st.subheader("🎯 Turn a news item into a script")
+
+                selected_idx = st.selectbox(
+                    "Choose a news item",
+                    options=list(range(len(items))),
+                    format_func=lambda i: _news_item_label(items[i], i),
+                    key="selected_news_idx",
+                )
+
+                gen_from_news = st.button(
+                    "Generate Script from Selected News",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_generate_from_news_clicked_news",
+                )
+
+                if gen_from_news:
+                    if not st.session_state.get("meta"):
+                        st.error("Corpus index not ready. Ensure `scripts.txt` is present and indexed.")
+                    else:
+                        client = get_openai_client(st.session_state.get("openai_api_key"))
+                        meta = st.session_state["meta"]
+
+                        chosen = items[int(selected_idx)]
+                        topic_from_news = _news_item_topic(chosen)
+                        anchor = _news_item_anchor(chosen)
+
+                        with st.spinner("Retrieving top chunks…"):
+                            top = retrieve_top_k(topic_from_news, meta, client, embed_model, k=k)
+                            retrieved: List[str] = []
+                            running = 0
+                            for idx in top:
+                                chunk = meta["chunks"][idx]
+                                if running + len(chunk) <= max_ctx_chars:
+                                    retrieved.append(chunk)
+                                    running += len(chunk)
+                            if not retrieved and top:
+                                retrieved.append(meta["chunks"][top[0]])
+
+                        with st.spinner("Generating script from selected news…"):
+                            messages = make_prompt(topic_from_news, retrieved, news_anchor=anchor)
+                            try:
+                                script = generate_script(client, gen_model, messages, temperature=temperature)
+                                st.session_state.pop("audio_bytes", None)
+                                st.session_state.pop("heygen_video_url", None)
+                            except Exception as e:
+                                st.error(f"Generation failed: {e}")
+                                st.stop()
+
+                        # save as if it came from normal topic input
+                        st.session_state.update(
+                            {
+                                "has_script": True,
+                                "last_script": script,
+                                "last_topic": topic_from_news,
+                                "last_facts_payload": None,  # will be computed if user runs fact check flow on rerun
+                            }
+                        )
+
+                        # show it immediately
+                        script_box.text_area("Generated script", value=script, height=320, key="generated_script_text")
+                        st.caption("Tip: Edit above before generating audio or downloading.")
+                        download_buttons_area(script, topic_from_news, None)
+
+
 
 
 elif clicked and not topic:
@@ -1493,6 +1612,70 @@ if not clicked_news and st.session_state.get("last_news_items"):
             use_container_width=True,
             hide_index=True
         )
+        st.divider()
+        st.subheader("🎯 Turn a news item into a script")
+
+        saved_items = st.session_state["last_news_items"]
+        selected_idx = st.selectbox(
+            "Choose a news item",
+            options=list(range(len(saved_items))),
+            format_func=lambda i: _news_item_label(saved_items[i], i),
+            key="selected_news_idx_persisted",
+        )
+
+        gen_from_news = st.button(
+            "Generate Script from Selected News",
+            type="primary",
+            use_container_width=True,
+            key="btn_generate_from_news_persisted",
+        )
+
+        if gen_from_news:
+            if not st.session_state.get("meta"):
+                st.error("Corpus index not ready. Ensure `scripts.txt` is present and indexed.")
+            else:
+                client = get_openai_client(st.session_state.get("openai_api_key"))
+                meta = st.session_state["meta"]
+
+                chosen = saved_items[int(selected_idx)]
+                topic_from_news = _news_item_topic(chosen)
+                anchor = _news_item_anchor(chosen)
+
+                with st.spinner("Retrieving top chunks…"):
+                    top = retrieve_top_k(topic_from_news, meta, client, embed_model, k=k)
+                    retrieved: List[str] = []
+                    running = 0
+                    for idx in top:
+                        chunk = meta["chunks"][idx]
+                        if running + len(chunk) <= max_ctx_chars:
+                            retrieved.append(chunk)
+                            running += len(chunk)
+                    if not retrieved and top:
+                        retrieved.append(meta["chunks"][top[0]])
+
+                with st.spinner("Generating script from selected news…"):
+                    messages = make_prompt(topic_from_news, retrieved, news_anchor=anchor)
+                    try:
+                        script = generate_script(client, gen_model, messages, temperature=temperature)
+                        st.session_state.pop("audio_bytes", None)
+                        st.session_state.pop("heygen_video_url", None)
+                    except Exception as e:
+                        st.error(f"Generation failed: {e}")
+                        st.stop()
+
+                st.session_state.update(
+                    {
+                        "has_script": True,
+                        "last_script": script,
+                        "last_topic": topic_from_news,
+                        "last_facts_payload": None,
+                    }
+                )
+
+                script_box.text_area("Generated script", value=script, height=320, key="generated_script_text")
+                st.caption("Tip: Edit above before generating audio or downloading.")
+                download_buttons_area(script, topic_from_news, None)
+
 
 
 # If user didn't click this run, keep previous results available (so buttons work after rerun)
