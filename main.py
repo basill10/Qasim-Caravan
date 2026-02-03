@@ -190,15 +190,44 @@ def _date_range_from_option(opt: str) -> tuple[str, str]:
     start = today - timedelta(days=days)
     return start.isoformat(), today.isoformat()
 
-
 def _safe_json_load(s: str) -> dict:
+    if not s:
+        return {}
+
+    # 1) Try direct
     try:
         return json.loads(s)
     except Exception:
-        m = re.search(r"\{.*\}", s, re.DOTALL)
-        if m:
-            return json.loads(m.group(0))
+        pass
+
+    # 2) Try extracting from ```json ... ```
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+
+    # 3) Balanced-brace extraction for first JSON object
+    start = s.find("{")
+    if start == -1:
         return {}
+
+    depth = 0
+    for i in range(start, len(s)):
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = s[start : i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return {}
+    return {}
+
 
 
 def _looks_unsafe_creators_text(t: str) -> bool:
@@ -395,6 +424,10 @@ Constraints:
     )
 
     raw = _extract_text_from_responses(resp)
+    with st.expander("🔎 Debug: raw Find News output", expanded=False):
+        st.code(raw or "(empty)")
+        st.write("Parsed keys:", list(data.keys()) if isinstance(data, dict) else type(data))
+
     data = _safe_json_load(raw)
     items = data.get("items") or []
     if not isinstance(items, list):
