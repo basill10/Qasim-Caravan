@@ -1329,6 +1329,9 @@ def render_script_editor_once():
     if not st.session_state.get("has_script"):
         return
 
+    if "pending_script_text" in st.session_state:
+        st.session_state["generated_script_text"] = st.session_state.pop("pending_script_text")
+
     script = st.session_state.get("last_script", "") or ""
     topic = st.session_state.get("last_topic", "") or ""
     facts_payload = st.session_state.get("last_facts_payload")
@@ -1416,7 +1419,7 @@ def render_revision_controls():
         st.session_state["script_revision_history"] = history
         st.session_state["script_revision_requests"] = recent_requests + [revision_request.strip()]
         st.session_state["last_script"] = revised
-        st.session_state["generated_script_text"] = revised
+        st.session_state["pending_script_text"] = revised
         st.session_state["last_facts_payload"] = None
         st.session_state["script_revision_request"] = ""
         st.session_state.pop("audio_bytes", None)
@@ -1430,7 +1433,7 @@ def render_revision_controls():
             return
 
         st.session_state["last_script"] = original_script
-        st.session_state["generated_script_text"] = original_script
+        st.session_state["pending_script_text"] = original_script
         st.session_state["script_revision_history"] = [original_script]
         st.session_state["script_revision_requests"] = []
         st.session_state["last_facts_payload"] = None
