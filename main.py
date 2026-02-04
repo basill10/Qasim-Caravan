@@ -1,4 +1,3 @@
-# streamlit_reel_writer_app.py
 """
 Streamlit UI for Instagram-style script generation with optional fact checking,
 ElevenLabs voiceover generation (preview, regenerate, download), and HeyGen avatar video
@@ -532,6 +531,14 @@ STYLE_SYSTEM_MSG = (
     "Produce ONE script only, no extra commentary or titles, no markdown.\n"
 )
 
+REVISION_SYSTEM_MSG = (
+    "You are GPT-5 acting as a script editor for short Instagram reels. "
+    "Preserve the voice, cadence, and tonality from the original script and style samples. "
+    "Only change what the user asks, keep the hook strong, and keep length similar unless asked to change it. "
+    "Stay neutral and positive, no emojis, no hashtags, no clickbait. "
+    "Return only the revised script, no commentary or markdown."
+)
+
 
 def make_prompt(topic: str, retrieved_chunks: List[str], news_anchor: str | None = None) -> List[Dict[str, str]]:
     context_block = "\n\n--- EXCERPTED STYLE/CONTENT SAMPLES ---\n" + "\n\n".join(retrieved_chunks)
@@ -556,6 +563,49 @@ Using the style learned from the samples below (structure, cadence, sentence len
 """
     return [
         {"role": "system", "content": STYLE_SYSTEM_MSG},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+def build_revision_messages(
+    *,
+    original_script: str,
+    current_script: str,
+    request: str,
+    style_samples: List[str] | None,
+    recent_requests: List[str] | None,
+) -> List[Dict[str, str]]:
+    style_block = ""
+    if style_samples:
+        style_block = "\n\n--- STYLE SAMPLES (tone reference) ---\n" + "\n\n".join(style_samples)
+
+    history_block = ""
+    if recent_requests:
+        trimmed = recent_requests[-6:]
+        history_block = "\n\n--- PRIOR CHANGE REQUESTS (most recent last) ---\n" + "\n".join(f"- {r}" for r in trimmed)
+
+    user_msg = f"""You will revise the CURRENT script using the user's request.
+
+Rules:
+- Keep the voice, cadence, and tonality from the original script and style samples.
+- Preserve meaning and factual content unless the request changes it.
+- Keep length similar unless the request asks to shorten or expand.
+- Return ONLY the revised script, no commentary or markdown.
+
+ORIGINAL SCRIPT:
+{original_script}
+
+CURRENT SCRIPT:
+{current_script}
+
+USER REQUEST:
+{request}
+{history_block}
+{style_block}
+"""
+
+    return [
+        {"role": "system", "content": REVISION_SYSTEM_MSG},
         {"role": "user", "content": user_msg},
     ]
 
@@ -713,7 +763,18 @@ def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], 
         raise RuntimeError("No text content returned by Responses fallback.")
 
 
-
+def revise_script_gpt5(client: OpenAI, messages: List[Dict[str, str]]) -> str:
+    resp = client.responses.create(
+        model="gpt-5",
+        input=messages,
+        text={"format": {"type": "text"}, "verbosity": "medium"},
+        reasoning={"effort": "medium", "summary": "auto"},
+        store=False,
+    )
+    text = _extract_text_from_responses(resp)
+    if not text:
+        raise RuntimeError("No text content returned by GPT-5 revision response.")
+    return text.strip()
 
 
 
@@ -770,6 +831,7 @@ FACT_VERIFY_SYS = (
     "- CITES: up to 3 URLs\n"
     'Return JSON: {"verdict":"...", "correction":"...", "confidence":0.0, "citations":["..."]}'
 )
+
 
 def verify_claim(client: OpenAI, model: str, claim: str, evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
     ev_text = "\n\n".join(
@@ -1218,13 +1280,20 @@ script_box = st.empty()
 news_box = st.container()
 facts_expander = st.expander("Fact-check results", expanded=False)
 
-def set_script_state(*, script: str, topic: str, facts_payload: dict | None):
+def set_script_state(*, script: str, topic: str, facts_payload: dict | None, style_samples: List[str] | None = None):
     st.session_state.update(
         {
             "has_script": True,
             "last_script": script,
             "last_topic": topic,
             "last_facts_payload": facts_payload,
+            "original_script": script,
+            "script_revision_history": [script],
+            "script_revision_requests": [],
+            "last_style_samples": (style_samples or [])[:6],
+            "generated_script_text": script,
+            "original_script_view": script,
+            "script_revision_request": "",
         }
     )
 
@@ -1265,8 +1334,104 @@ def render_script_editor_once():
     st.caption("Tip: Edit above before generating audio or downloading.")
     download_buttons_area(current_script_text, topic, facts_payload)
 
+
+def render_revision_controls():
+    st.subheader("3) Refine the script")
+
+    if not st.session_state.get("has_script"):
+        st.caption("Generate a script first.")
+        return
+
+    if not st.session_state.get("openai_api_key"):
+        st.info("Add your OPENAI_API_KEY in the sidebar to enable GPT-5 revisions.")
+        return
+
+    current_script = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
+    original_script = st.session_state.get("original_script") or current_script
+
+    with st.expander("Original script (saved)", expanded=False):
+        st.text_area(
+            "Original script",
+            value=original_script,
+            height=240,
+            key="original_script_view",
+            disabled=True,
+        )
+
+    st.caption("Ask for tweaks. GPT-5 keeps tone/cadence from the corpus and original script.")
+    revision_request = st.text_area(
+        "Change request",
+        key="script_revision_request",
+        placeholder="e.g., reduce length by ~15% and tighten the last paragraph",
+    )
+
+    col1, col2, _ = st.columns([1, 1, 2])
+    apply_changes = col1.button(
+        "Apply changes",
+        type="primary",
+        use_container_width=True,
+        key="btn_apply_revision",
+    )
+    reset_original = col2.button(
+        "Reset to original",
+        use_container_width=True,
+        key="btn_reset_original",
+    )
+
+    if apply_changes:
+        if not revision_request.strip():
+            st.warning("Enter a change request first.")
+            return
+
+        try:
+            client = get_openai_client(st.session_state.get("openai_api_key"))
+            recent_requests = st.session_state.get("script_revision_requests") or []
+            style_samples = st.session_state.get("last_style_samples") or []
+            messages = build_revision_messages(
+                original_script=original_script,
+                current_script=current_script,
+                request=revision_request.strip(),
+                style_samples=style_samples,
+                recent_requests=recent_requests,
+            )
+            with st.spinner("Applying changes with GPT-5…"):
+                revised = revise_script_gpt5(client, messages)
+        except Exception as e:
+            st.error(f"Revision failed: {e}")
+            return
+
+        history = st.session_state.get("script_revision_history") or [original_script]
+        history.append(revised)
+        st.session_state["script_revision_history"] = history
+        st.session_state["script_revision_requests"] = recent_requests + [revision_request.strip()]
+        st.session_state["last_script"] = revised
+        st.session_state["generated_script_text"] = revised
+        st.session_state["last_facts_payload"] = None
+        st.session_state["script_revision_request"] = ""
+        st.session_state.pop("audio_bytes", None)
+        st.session_state.pop("heygen_video_url", None)
+        st.toast("Script updated", icon="✏️")
+        st.rerun()
+
+    if reset_original:
+        if not original_script:
+            st.warning("No original script saved yet.")
+            return
+
+        st.session_state["last_script"] = original_script
+        st.session_state["generated_script_text"] = original_script
+        st.session_state["script_revision_history"] = [original_script]
+        st.session_state["script_revision_requests"] = []
+        st.session_state["last_facts_payload"] = None
+        st.session_state["script_revision_request"] = ""
+        st.session_state.pop("audio_bytes", None)
+        st.session_state.pop("heygen_video_url", None)
+        st.toast("Reverted to original script", icon="↩️")
+        st.rerun()
+
+
 def render_voiceover_section():
-    st.subheader("3) Voiceover (ElevenLabs)")
+    st.subheader("4) Voiceover (ElevenLabs)")
 
     if not st.session_state.get("has_script"):
         st.caption("Generate a script first.")
@@ -1317,8 +1482,9 @@ def render_voiceover_section():
     else:
         st.caption("No audio yet. Generate to preview.")
 
+
 def render_video_section():
-    st.subheader("4) Render Video (HeyGen)")
+    st.subheader("5) Render Video (HeyGen)")
 
     if not st.session_state.get("has_script"):
         st.caption("Generate a script first.")
@@ -1551,7 +1717,7 @@ if clicked_generate:
                             for i, url in enumerate(bibliography, start=1):
                                 st.markdown(f"[{i}] {url}")
 
-        set_script_state(script=script, topic=topic, facts_payload=facts_payload)
+        set_script_state(script=script, topic=topic, facts_payload=facts_payload, style_samples=retrieved)
         st.rerun()
 
 # -------------------------------
@@ -1648,12 +1814,13 @@ if st.session_state.get("last_news_items") is not None and len(st.session_state.
                             st.error(f"Generation failed: {e}")
                             st.stop()
 
-                    set_script_state(script=script, topic=topic_from_news, facts_payload=None)
+                    set_script_state(script=script, topic=topic_from_news, facts_payload=None, style_samples=retrieved)
                     st.rerun()
 
 # -------------------------------
 # Render script editor ONCE + then downstream sections
 # -------------------------------
 render_script_editor_once()
+render_revision_controls()
 render_voiceover_section()
 render_video_section()
