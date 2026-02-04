@@ -1280,7 +1280,14 @@ script_box = st.empty()
 news_box = st.container()
 facts_expander = st.expander("Fact-check results", expanded=False)
 
-def set_script_state(*, script: str, topic: str, facts_payload: dict | None, style_samples: List[str] | None = None):
+def set_script_state(
+    *,
+    script: str,
+    topic: str,
+    facts_payload: dict | None,
+    style_samples: List[str] | None = None,
+    source: str | None = None,
+):
     st.session_state.update(
         {
             "has_script": True,
@@ -1294,6 +1301,7 @@ def set_script_state(*, script: str, topic: str, facts_payload: dict | None, sty
             "generated_script_text": script,
             "original_script_view": script,
             "script_revision_request": "",
+            "script_source": source or "generated",
         }
     )
 
@@ -1358,7 +1366,10 @@ def render_revision_controls():
             disabled=True,
         )
 
-    st.caption("Ask for tweaks. GPT-5 keeps tone/cadence from the corpus and original script.")
+    if st.session_state.get("script_source") == "pasted":
+        st.caption("Working from your pasted script. GPT-5 keeps tone/cadence from the original and corpus.")
+    else:
+        st.caption("Ask for tweaks. GPT-5 keeps tone/cadence from the corpus and original script.")
     revision_request = st.text_area(
         "Change request",
         key="script_revision_request",
@@ -1619,6 +1630,7 @@ with st.expander("Use your own script (paste)", expanded=False):
                 topic=topic_for_paste,
                 facts_payload=None,
                 style_samples=style_samples,
+                source="pasted",
             )
             st.session_state.pop("audio_bytes", None)
             st.session_state.pop("heygen_video_url", None)
@@ -1770,7 +1782,7 @@ if clicked_generate:
                             for i, url in enumerate(bibliography, start=1):
                                 st.markdown(f"[{i}] {url}")
 
-        set_script_state(script=script, topic=topic, facts_payload=facts_payload, style_samples=retrieved)
+        set_script_state(script=script, topic=topic, facts_payload=facts_payload, style_samples=retrieved, source="generated")
         st.rerun()
 
 # -------------------------------
@@ -1867,7 +1879,13 @@ if st.session_state.get("last_news_items") is not None and len(st.session_state.
                             st.error(f"Generation failed: {e}")
                             st.stop()
 
-                    set_script_state(script=script, topic=topic_from_news, facts_payload=None, style_samples=retrieved)
+                    set_script_state(
+                        script=script,
+                        topic=topic_from_news,
+                        facts_payload=None,
+                        style_samples=retrieved,
+                        source="news",
+                    )
                     st.rerun()
 
 # -------------------------------
