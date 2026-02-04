@@ -1357,6 +1357,9 @@ def render_revision_controls():
         st.info("Add your OPENAI_API_KEY in the sidebar to enable GPT-5 revisions.")
         return
 
+    if "pending_revision_request" in st.session_state:
+        st.session_state["script_revision_request"] = st.session_state.pop("pending_revision_request")
+
     current_script = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
     original_script = st.session_state.get("original_script") or current_script
 
@@ -1421,7 +1424,7 @@ def render_revision_controls():
         st.session_state["last_script"] = revised
         st.session_state["pending_script_text"] = revised
         st.session_state["last_facts_payload"] = None
-        st.session_state["script_revision_request"] = ""
+        st.session_state["pending_revision_request"] = ""
         st.session_state.pop("audio_bytes", None)
         st.session_state.pop("heygen_video_url", None)
         st.toast("Script updated", icon="✏️")
@@ -1437,7 +1440,7 @@ def render_revision_controls():
         st.session_state["script_revision_history"] = [original_script]
         st.session_state["script_revision_requests"] = []
         st.session_state["last_facts_payload"] = None
-        st.session_state["script_revision_request"] = ""
+        st.session_state["pending_revision_request"] = ""
         st.session_state.pop("audio_bytes", None)
         st.session_state.pop("heygen_video_url", None)
         st.toast("Reverted to original script", icon="↩️")
