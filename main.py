@@ -1571,6 +1571,59 @@ st.subheader("2) Generate a script")
 
 topic_input = st.text_input("Topic", placeholder="e.g., Pakistan's fintech wave in 2025", key="topic_input")
 
+# --- Paste existing script ---
+with st.expander("Use your own script (paste)", expanded=False):
+    pasted_script = st.text_area(
+        "Paste script",
+        key="pasted_script_text",
+        height=220,
+        placeholder="Paste your script here…",
+    )
+    pasted_title = st.text_input(
+        "Optional title/topic",
+        key="pasted_script_title",
+        placeholder="e.g., Custom reel script",
+    )
+    colp1, _ = st.columns([1, 3])
+    use_pasted = colp1.button(
+        "Use pasted script",
+        type="primary",
+        use_container_width=True,
+        key="btn_use_pasted_script",
+    )
+
+    if use_pasted:
+        if not pasted_script.strip():
+            st.warning("Paste a script first.")
+        else:
+            topic_for_paste = pasted_title.strip() or topic_input.strip() or "Custom script"
+            style_samples: List[str] = []
+            if st.session_state.get("meta") and st.session_state.get("openai_api_key"):
+                try:
+                    client = get_openai_client(st.session_state.get("openai_api_key"))
+                    meta = st.session_state["meta"]
+                    top = retrieve_top_k(topic_for_paste, meta, client, embed_model, k=k)
+                    running = 0
+                    for idx in top:
+                        chunk = meta["chunks"][idx]
+                        if running + len(chunk) <= max_ctx_chars:
+                            style_samples.append(chunk)
+                            running += len(chunk)
+                    if not style_samples and top:
+                        style_samples.append(meta["chunks"][top[0]])
+                except Exception:
+                    style_samples = []
+
+            set_script_state(
+                script=pasted_script.strip(),
+                topic=topic_for_paste,
+                facts_payload=None,
+                style_samples=style_samples,
+            )
+            st.session_state.pop("audio_bytes", None)
+            st.session_state.pop("heygen_video_url", None)
+            st.rerun()
+
 # --- News controls ---
 news_col1, news_col2, news_col3 = st.columns([1.2, 1.2, 1.6])
 news_mode = news_col1.selectbox("Find News for", ["Creators", "Founders"], index=0)
