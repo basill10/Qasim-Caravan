@@ -1714,6 +1714,15 @@ def render_voiceover_section():
         except Exception as e:
             st.error(f"Audio generation failed: {e}")
 
+    if st.session_state.get("last_tts_text"):
+        with st.expander("Urdu-converted transcript (TTS input)", expanded=False):
+            st.text_area(
+                "TTS transcript",
+                value=st.session_state.get("last_tts_text") or "",
+                height=240,
+                disabled=True,
+            )
+
     if st.session_state.get("audio_bytes"):
         st.audio(st.session_state["audio_bytes"], format="audio/mpeg")
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
