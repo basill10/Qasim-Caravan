@@ -1515,6 +1515,9 @@ def set_script_state(
             "original_script_view": script,
             "script_revision_request": "",
             "script_source": source or "generated",
+            "tts_ready_text": "",
+            "tts_source_hash": "",
+            "last_tts_text": "",
         }
     )
 
@@ -1640,6 +1643,9 @@ def render_revision_controls():
         st.session_state["pending_revision_request"] = ""
         st.session_state.pop("audio_bytes", None)
         st.session_state.pop("heygen_video_url", None)
+        st.session_state.pop("tts_ready_text", None)
+        st.session_state.pop("tts_source_hash", None)
+        st.session_state.pop("last_tts_text", None)
         st.toast("Script updated", icon="✏️")
         st.rerun()
 
@@ -1656,6 +1662,9 @@ def render_revision_controls():
         st.session_state["pending_revision_request"] = ""
         st.session_state.pop("audio_bytes", None)
         st.session_state.pop("heygen_video_url", None)
+        st.session_state.pop("tts_ready_text", None)
+        st.session_state.pop("tts_source_hash", None)
+        st.session_state.pop("last_tts_text", None)
         st.toast("Reverted to original script", icon="↩️")
         st.rerun()
 
@@ -1678,50 +1687,83 @@ def render_voiceover_section():
         st.warning("Select a voice in the sidebar.")
         return
 
+    if "pending_tts_text" in st.session_state:
+        st.session_state["tts_ready_text"] = st.session_state.pop("pending_tts_text")
+    if "pending_tts_source_hash" in st.session_state:
+        st.session_state["tts_source_hash"] = st.session_state.pop("pending_tts_source_hash")
+
+    current_script = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
+    current_hash = sha256_bytes(current_script.encode("utf-8")) if current_script else ""
+
     c1, c2, _ = st.columns([1, 1, 2])
-    make_audio = c1.button("Generate Audio", type="primary", use_container_width=True, key="btn_make_audio")
-    regen_audio = c2.button("Regenerate", use_container_width=True, key="btn_regen_audio")
+    convert_btn = c1.button("Convert to Urdu Script", type="primary", use_container_width=True, key="btn_convert_urdu")
+    reconvert_btn = c2.button("Reconvert", use_container_width=True, key="btn_reconvert_urdu")
+    do_convert = convert_btn or reconvert_btn
+
+    if do_convert:
+        if not current_script.strip():
+            st.warning("No script to convert yet.")
+        else:
+            try:
+                client = get_openai_client(st.session_state.get("openai_api_key"))
+                cache = st.session_state.setdefault("tts_urdu_cache", {})
+                key = sha256_bytes(current_script.encode("utf-8"))
+                if key in cache:
+                    converted = cache[key]
+                else:
+                    with st.spinner("Converting Urdu words to Urdu script…"):
+                        converted = urdu_scriptify_text(client, current_script)
+                    cache[key] = converted
+                    st.session_state["tts_urdu_cache"] = cache
+
+                st.session_state["pending_tts_text"] = converted
+                st.session_state["pending_tts_source_hash"] = key
+                st.session_state["last_tts_text"] = converted
+                st.toast("Urdu transcript ready", icon="📝")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Conversion failed: {e}")
+
+    if st.session_state.get("tts_ready_text"):
+        st.text_area(
+            "Urdu transcript (editable, used for TTS)",
+            key="tts_ready_text",
+            height=240,
+        )
+    else:
+        st.caption("Click “Convert to Urdu Script” to generate the TTS transcript.")
+
+    tts_ready_text = st.session_state.get("tts_ready_text") or ""
+    tts_source_hash = st.session_state.get("tts_source_hash") or ""
+    stale_conversion = bool(tts_ready_text and tts_source_hash and tts_source_hash != current_hash)
+    if stale_conversion:
+        st.warning("The script has changed since conversion. Please reconvert before generating audio.")
+
+    c3, c4, _ = st.columns([1, 1, 2])
+    make_audio = c3.button("Generate Audio", type="primary", use_container_width=True, key="btn_make_audio")
+    regen_audio = c4.button("Regenerate", use_container_width=True, key="btn_regen_audio")
     do_tts = make_audio or regen_audio
 
-    tts_text = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
-
     if do_tts:
-        try:
-            client = get_openai_client(st.session_state.get("openai_api_key"))
-            cache = st.session_state.setdefault("tts_urdu_cache", {})
-            key = sha256_bytes(tts_text.encode("utf-8"))
-            if key in cache:
-                tts_ready_text = cache[key]
-            else:
-                with st.spinner("Converting Urdu words to Urdu script…"):
-                    tts_ready_text = urdu_scriptify_text(client, tts_text)
-                cache[key] = tts_ready_text
-                st.session_state["tts_urdu_cache"] = cache
-
-            st.session_state["last_tts_text"] = tts_ready_text
-
-            with st.spinner("Generating voiceover…"):
-                audio_bytes = eleven_tts(
-                    st.session_state["eleven_api_key"],
-                    st.session_state["eleven_voice_id"],
-                    tts_ready_text,
-                    model_id="eleven_multilingual_v2",
-                    **(st.session_state.get("eleven_settings") or {}),
-                )
-            st.session_state["audio_bytes"] = audio_bytes
-            st.session_state.pop("heygen_video_url", None)
-            st.toast("Audio ready", icon="🔊")
-        except Exception as e:
-            st.error(f"Audio generation failed: {e}")
-
-    if st.session_state.get("last_tts_text"):
-        with st.expander("Urdu-converted transcript (TTS input)", expanded=False):
-            st.text_area(
-                "TTS transcript",
-                value=st.session_state.get("last_tts_text") or "",
-                height=240,
-                disabled=True,
-            )
+        if not tts_ready_text.strip():
+            st.error("Please convert to Urdu script first.")
+        elif stale_conversion:
+            st.error("Please reconvert after script changes.")
+        else:
+            try:
+                with st.spinner("Generating voiceover…"):
+                    audio_bytes = eleven_tts(
+                        st.session_state["eleven_api_key"],
+                        st.session_state["eleven_voice_id"],
+                        tts_ready_text,
+                        model_id="eleven_multilingual_v2",
+                        **(st.session_state.get("eleven_settings") or {}),
+                    )
+                st.session_state["audio_bytes"] = audio_bytes
+                st.session_state.pop("heygen_video_url", None)
+                st.toast("Audio ready", icon="🔊")
+            except Exception as e:
+                st.error(f"Audio generation failed: {e}")
 
     if st.session_state.get("audio_bytes"):
         st.audio(st.session_state["audio_bytes"], format="audio/mpeg")
