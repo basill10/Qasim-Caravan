@@ -851,6 +851,31 @@ def revise_script_gpt5(client: OpenAI, messages: List[Dict[str, str]]) -> str:
     return text.strip()
 
 
+def urdu_scriptify_text(client: OpenAI, text: str) -> str:
+    """
+    Convert Urdu words/names written in Latin characters into Urdu script for TTS.
+    Keeps English text, punctuation, and line breaks unchanged.
+    """
+    if not text.strip():
+        return text
+
+    sys_msg = (
+        "You convert Urdu words and names written in Latin letters into Urdu script. "
+        "Keep English words in Latin script. Preserve punctuation, spacing, numbers, and line breaks. "
+        "Do not translate English content. Output ONLY the converted text."
+    )
+    user_msg = f"TEXT:\n{text}"
+
+    resp = client.responses.create(
+        model="gpt-5.2",
+        input=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+        text={"format": {"type": "text"}, "verbosity": "low"},
+        reasoning={"effort": "low", "summary": "auto"},
+        store=False,
+    )
+    out = _extract_text_from_responses(resp)
+    return out.strip() if out else text
+
 
 
 
@@ -1558,6 +1583,10 @@ def render_voiceover_section():
         st.caption("Generate a script first.")
         return
 
+    if not st.session_state.get("openai_api_key"):
+        st.info("Add OPENAI_API_KEY in the sidebar to enable Urdu script conversion before TTS.")
+        return
+
     if not st.session_state.get("eleven_api_key"):
         st.info("Add ELEVENLABS_API_KEY in the sidebar to enable audio generation.")
         return
@@ -1574,11 +1603,24 @@ def render_voiceover_section():
 
     if do_tts:
         try:
+            client = get_openai_client(st.session_state.get("openai_api_key"))
+            cache = st.session_state.setdefault("tts_urdu_cache", {})
+            key = sha256_bytes(tts_text.encode("utf-8"))
+            if key in cache:
+                tts_ready_text = cache[key]
+            else:
+                with st.spinner("Converting Urdu words to Urdu script…"):
+                    tts_ready_text = urdu_scriptify_text(client, tts_text)
+                cache[key] = tts_ready_text
+                st.session_state["tts_urdu_cache"] = cache
+
+            st.session_state["last_tts_text"] = tts_ready_text
+
             with st.spinner("Generating voiceover…"):
                 audio_bytes = eleven_tts(
                     st.session_state["eleven_api_key"],
                     st.session_state["eleven_voice_id"],
-                    tts_text,
+                    tts_ready_text,
                     model_id="eleven_multilingual_v2",
                     **(st.session_state.get("eleven_settings") or {}),
                 )
