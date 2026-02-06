@@ -452,6 +452,15 @@ NEWS_SYS = (
     "- Summaries must be 1–2 sentences.\n"
 )
 
+NEWS_RESEARCH_SYS = (
+    "You are a meticulous research assistant. Use web_search to verify and expand on the selected news item.\n"
+    "Rules:\n"
+    "- Do NOT hallucinate or invent facts.\n"
+    "- If a detail is unclear, mark it as uncertain.\n"
+    "- Keep output concise and structured with headings.\n"
+    "- Return ONLY the research dump text, no markdown.\n"
+)
+
 def find_news(
     client: OpenAI,
     *,
@@ -589,6 +598,54 @@ Constraints:
     return out, {"raw": raw, "data": data}
 
 
+def research_news_dump_gpt52(client: OpenAI, *, topic: str, anchor: str) -> str:
+    user_prompt = f"""
+Selected news item:
+{anchor}
+
+Task:
+- Use web_search to verify the key facts about this item and gather any relevant context.
+- Focus on names, dates, locations, organizations, and what happened.
+- Keep the output concise and structured.
+
+Output format (plain text, no markdown):
+Key Facts:
+- ...
+
+Timeline:
+- ...
+
+Context:
+...
+
+Names/Orgs:
+- ...
+
+Sources:
+- URL
+""".strip()
+
+    resp = client.responses.create(
+        model="gpt-5.2",
+        input=[
+            {"role": "system", "content": NEWS_RESEARCH_SYS},
+            {"role": "user", "content": user_prompt},
+        ],
+        tools=[{
+            "type": "web_search",
+            "user_location": {"type": "approximate"},
+            "search_context_size": "medium",
+        }],
+        text={"format": {"type": "text"}, "verbosity": "medium"},
+        max_output_tokens=1800,
+        include=["web_search_call.action.sources"],
+        store=False,
+    )
+
+    research = _extract_text_from_responses(resp)
+    return research.strip() if research else ""
+
+
 # -------------------------------
 # Retrieval & Generation
 # -------------------------------
@@ -614,7 +671,12 @@ REVISION_SYSTEM_MSG = (
 )
 
 
-def make_prompt(topic: str, retrieved_chunks: List[str], news_anchor: str | None = None) -> List[Dict[str, str]]:
+def make_prompt(
+    topic: str,
+    retrieved_chunks: List[str],
+    news_anchor: str | None = None,
+    research_dump: str | None = None,
+) -> List[Dict[str, str]]:
     context_block = "\n\n--- EXCERPTED STYLE/CONTENT SAMPLES ---\n" + "\n\n".join(retrieved_chunks)
 
     anchor_block = ""
@@ -629,10 +691,20 @@ def make_prompt(topic: str, retrieved_chunks: List[str], news_anchor: str | None
             "- Do not mention 'sources' or 'fact anchor' in the script.\n"
         )
 
+    research_block = ""
+    if research_dump:
+        research_block = (
+            "\n\n--- RESEARCH DUMP (verified context) ---\n"
+            f"{research_dump}\n"
+            "\nRules for the research dump:\n"
+            "- Use it to ground facts and details.\n"
+            "- Do not mention 'research dump' in the script.\n"
+        )
+
     user_msg = f"""Topic: {topic}
 
 Using the style learned from the samples below (structure, cadence, sentence length, and tone), write a new script tailored to the topic. Avoid copying lines verbatim. Prefer locally relevant angles (Pakistan when applicable), concrete numbers, and short paragraph beats.
-{anchor_block}
+{anchor_block}{research_block}
 {context_block}
 """
     return [
@@ -796,21 +868,33 @@ def _extract_text_from_responses(resp: Any) -> str:
 
 
 
-def generate_script(client: OpenAI, model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+def generate_script(
+    client: OpenAI,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.7,
+    *,
+    use_web_search: bool = True,
+) -> str:
     if is_gpt5(model):
-        resp = client.responses.create(
-            model=model,
-            input=messages,
-            text={"format": {"type": "text"}, "verbosity": "medium"},
-            reasoning={"effort": "medium", "summary": "auto"},
-            tools=[{
+        payload: Dict[str, Any] = {
+            "model": model,
+            "input": messages,
+            "text": {"format": {"type": "text"}, "verbosity": "medium"},
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "store": True,
+        }
+        if use_web_search:
+            payload["tools"] = [{
                 "type": "web_search",
                 "user_location": {"type": "approximate"},
                 "search_context_size": "medium",
-            }],
-            store=True,
-            include=["reasoning.encrypted_content", "web_search_call.action.sources"],
-        )
+            }]
+            payload["include"] = ["reasoning.encrypted_content", "web_search_call.action.sources"]
+        else:
+            payload["include"] = ["reasoning.encrypted_content"]
+
+        resp = client.responses.create(**payload)
         text = _extract_text_from_responses(resp)
         if not text:
             raise RuntimeError("No text content returned by GPT-5 response.")
@@ -2068,10 +2152,28 @@ if st.session_state.get("last_news_items") is not None and len(st.session_state.
                         if not retrieved and top:
                             retrieved.append(meta["chunks"][top[0]])
 
-                    with st.spinner("Generating script from selected news…"):
-                        messages = make_prompt(topic_from_news, retrieved, news_anchor=anchor)
+                    with st.spinner("Researching selected news with GPT-5.2…"):
+                        research_dump = research_news_dump_gpt52(
+                            client,
+                            topic=topic_from_news,
+                            anchor=anchor,
+                        )
+
+                    with st.spinner("Generating script from research…"):
+                        messages = make_prompt(
+                            topic_from_news,
+                            retrieved,
+                            news_anchor=anchor,
+                            research_dump=research_dump,
+                        )
                         try:
-                            script = generate_script(client, gen_model, messages, temperature=temperature)
+                            script = generate_script(
+                                client,
+                                "gpt-5",
+                                messages,
+                                temperature=temperature,
+                                use_web_search=False,
+                            )
                             st.session_state.pop("audio_bytes", None)
                             st.session_state.pop("heygen_video_url", None)
                         except Exception as e:
