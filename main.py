@@ -1,7 +1,7 @@
 """
 Streamlit UI for Instagram-style script generation with optional fact checking,
 ElevenLabs voiceover generation (preview, regenerate, download), and HeyGen avatar video
-rendering using a standard **video avatar** (NO Avatar IV / talking-photo).
+rendering with Avatar IV Talking Photos or standard video avatars.
 
 Run:
     streamlit run streamlit_reel_writer_app.py
@@ -21,8 +21,7 @@ Auth:
 
 Notes:
 - For GPT-5 models ("gpt-5", "gpt-5-pro"), we use the Responses API and NEVER send `temperature`.
-- HeyGen integration now supports only a **video avatar**:
-    * character = {"type": "avatar", "avatar_id": "..."}
+- HeyGen integration uses Avatar IV for Talking Photos via `/v2/video/generate` and supports video avatars too.
 - This version prefers the **HeyGen audio-asset flow**:
     1) Generate MP3 with ElevenLabs (in-memory).
     2) Upload MP3 to HeyGen Assets (/v1/asset) → get `asset_id`.
@@ -207,6 +206,81 @@ def _news_item_topic(it: dict) -> str:
         return f"{name} — {headline}"
     return headline or name or "Selected news story"
 
+def parse_uploaded_news_txt(text: str) -> List[Dict[str, str]]:
+    """
+    Parse uploaded TXT into news items.
+
+    Expected format (repeated blocks):
+    1. Name:
+    Headline line
+    Summary line (optional)
+    """
+    if not text:
+        return []
+
+    blocks: List[List[str]] = []
+    current: List[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+
+        m = re.match(r"^\s*\d+\.\s*(.*)$", line)
+        if m:
+            if current:
+                blocks.append(current)
+            current = [m.group(1).strip()]
+        else:
+            current.append(line)
+
+    if current:
+        blocks.append(current)
+
+    items: List[Dict[str, str]] = []
+    for b in blocks:
+        if not b:
+            continue
+        name = (b[0] or "").rstrip(":").strip()
+        headline = b[1].strip() if len(b) >= 2 else ""
+        if not headline:
+            continue
+        if len(b) >= 3:
+            summary = " ".join(x.strip() for x in b[2:] if x.strip())
+        else:
+            summary = headline
+
+        items.append(
+            {
+                "Name": name,
+                "Headline": headline,
+                "Summary": summary,
+                "Published": "",
+                "URL": "",
+                "Source": "Uploaded",
+            }
+        )
+
+    return items
+
+def merge_news_items(existing: List[Dict[str, Any]], new_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _key(it: Dict[str, Any]) -> tuple[str, str]:
+        name = (it.get("Name") or "").strip().lower()
+        headline = (it.get("Headline") or "").strip().lower()
+        return (name, headline)
+
+    seen = {_key(it) for it in (existing or [])}
+    merged = list(existing or [])
+    for it in new_items:
+        key = _key(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(it)
+    return merged
 
 def _date_range_from_option(opt: str) -> tuple[str, str]:
     """
@@ -1065,7 +1139,10 @@ def heygen_get_avatar_details(api_key: str, avatar_id: str) -> dict:
 def heygen_generate_video(
     api_key: str,
     *,
-    avatar_id: Optional[str],
+    character_type: str,
+    avatar_id: Optional[str] = None,
+    talking_photo_id: Optional[str] = None,
+    use_avatar_iv_model: bool = False,
     audio_asset_id: Optional[str] = None,
     audio_url: Optional[str] = None,
     width: int = 1280,
@@ -1073,15 +1150,19 @@ def heygen_generate_video(
     background_color: Optional[str] = None,
 ) -> str:
     """
-    Generate a HeyGen video using ONLY a standard video avatar (Avatar IV disabled).
+    Generate a HeyGen video. Supports video avatars and Avatar IV (talking photo).
     """
     if not (audio_asset_id or audio_url):
         raise ValueError("Provide either audio_asset_id or audio_url for HeyGen voice.")
 
-    if not avatar_id:
-        raise ValueError("Provide avatar_id (video avatar). Talking-photo (Avatar IV) is disabled in this build.")
-
-    character = {"type": "avatar", "avatar_id": avatar_id, "avatar_style": "normal"}
+    if character_type == "talking_photo":
+        if not talking_photo_id:
+            raise ValueError("Provide talking_photo_id for Avatar IV (talking photo).")
+        character = {"type": "talking_photo", "talking_photo_id": talking_photo_id}
+    else:
+        if not avatar_id:
+            raise ValueError("Provide avatar_id (video avatar).")
+        character = {"type": "avatar", "avatar_id": avatar_id, "avatar_style": "normal"}
 
     voice: Dict[str, Any] = {"type": "audio"}
     if audio_asset_id:
@@ -1093,7 +1174,9 @@ def heygen_generate_video(
     if background_color:
         video_input["background"] = {"type": "color", "value": background_color}
 
-    payload = {"video_inputs": [video_input], "dimension": {"width": width, "height": height}}
+    payload: Dict[str, Any] = {"video_inputs": [video_input], "dimension": {"width": width, "height": height}}
+    if use_avatar_iv_model:
+        payload["use_avatar_iv_model"] = True
 
     r = requests.post(f"{HEYGEN_BASE_V2}/video/generate", headers=_heygen_headers_json(api_key), data=json.dumps(payload), timeout=60)
     if r.status_code != 200:
@@ -1131,7 +1214,7 @@ st.set_page_config(page_title="Reel Script Generator", page_icon="🎬", layout=
 require_login()
 
 st.title("🎬 Reel Script Generator")
-st.caption("Generate scripts, voice them with ElevenLabs, then upload MP3 to HeyGen Assets and render the avatar video (video avatars only — Avatar IV disabled).")
+st.caption("Generate scripts, voice them with ElevenLabs, then upload MP3 to HeyGen Assets and render the avatar video (Avatar IV Talking Photos supported).")
 
 # Sidebar: keys & settings
 with st.sidebar:
@@ -1214,15 +1297,35 @@ with st.sidebar:
     heygen_api_key = st.text_input("HEYGEN_API_KEY", value=HEYGEN_API_KEY_ENV, type="password")
     st.session_state["heygen_api_key"] = heygen_api_key
 
-    st.caption("Select a VIDEO avatar (avatar_id). Talking-photo (Avatar IV) is disabled in this build.")
-    avatar_id_input = st.text_input("HeyGen AVATAR ID (video avatar)", value="", placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf")
-    st.session_state["avatar_id_input"] = avatar_id_input.strip()
+    avatar_type = st.selectbox(
+        "Avatar type",
+        ["Talking Photo (Avatar IV)", "Video Avatar"],
+        index=0,
+    )
+    st.session_state["heygen_avatar_type"] = "talking_photo" if avatar_type.startswith("Talking Photo") else "avatar"
 
-    engine = "Video Avatar (Avatar IV disabled)"
-    st.caption(f"Engine: {engine}")
+    if st.session_state["heygen_avatar_type"] == "talking_photo":
+        st.caption("Avatar IV engine is enabled for Talking Photos.")
+        talking_photo_id_input = st.text_input(
+            "Talking Photo ID (talking_photo_id)",
+            value="",
+            placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf",
+        )
+        st.session_state["talking_photo_id_input"] = talking_photo_id_input.strip()
+        st.session_state["avatar_id_input"] = ""
+    else:
+        st.caption("Uses standard video avatar engine (avatar_id).")
+        avatar_id_input = st.text_input(
+            "Video Avatar ID (avatar_id)",
+            value="",
+            placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf",
+        )
+        st.session_state["avatar_id_input"] = avatar_id_input.strip()
+        st.session_state["talking_photo_id_input"] = ""
 
-    heygen_width = st.number_input("Video Width", min_value=320, max_value=1920, value=1280, step=10)
-    heygen_height = st.number_input("Video Height", min_value=240, max_value=1080, value=720, step=10)
+    st.caption("Output defaults to vertical 9:16.")
+    heygen_width = st.number_input("Video Width", min_value=320, max_value=1920, value=1080, step=10)
+    heygen_height = st.number_input("Video Height", min_value=240, max_value=1920, value=1920, step=10)
     heygen_bg = st.text_input("Background color (hex, optional)", value="#000000")
 
     audio_asset_id_input = st.text_input("Use existing HeyGen audio_asset_id (optional)", value="")
@@ -1235,6 +1338,7 @@ with st.sidebar:
             "heygen_bg": heygen_bg,
             "audio_asset_id_input": audio_asset_id_input.strip(),
             "audio_url_input": audio_url_input.strip(),
+            "use_avatar_iv_model": st.session_state.get("heygen_avatar_type") == "talking_photo",
         }
     )
 
@@ -1538,22 +1642,38 @@ def render_video_section():
                 st.error(f"HeyGen audio upload failed: {e}")
                 return
 
+        avatar_type = st.session_state.get("heygen_avatar_type", "talking_photo")
         avatar_id = st.session_state.get("avatar_id_input")
-        if not avatar_id:
-            st.error("Please provide a HeyGen AVATAR ID (video avatar).")
-            return
+        talking_photo_id = st.session_state.get("talking_photo_id_input")
+
+        if avatar_type == "talking_photo":
+            if not talking_photo_id:
+                st.error("Please provide a Talking Photo ID (talking_photo_id) for Avatar IV.")
+                return
+        else:
+            if not avatar_id:
+                st.error("Please provide a Video Avatar ID (avatar_id).")
+                return
 
         try:
-            heygen_get_avatar_details(st.session_state["heygen_api_key"], avatar_id)
+            if avatar_type == "avatar" and avatar_id:
+                heygen_get_avatar_details(st.session_state["heygen_api_key"], avatar_id)
 
             with st.spinner("Starting HeyGen video generation…"):
+                width = int(st.session_state["heygen_width"])
+                height = int(st.session_state["heygen_height"])
+                if width >= height:
+                    width, height = min(width, height), max(width, height)
                 video_id = heygen_generate_video(
                     st.session_state["heygen_api_key"],
+                    character_type=avatar_type,
                     avatar_id=avatar_id,
+                    talking_photo_id=talking_photo_id,
+                    use_avatar_iv_model=bool(st.session_state.get("use_avatar_iv_model")),
                     audio_asset_id=chosen_asset_id or None,
                     audio_url=chosen_audio_url or None,
-                    width=int(st.session_state["heygen_width"]),
-                    height=int(st.session_state["heygen_height"]),
+                    width=width,
+                    height=height,
                     background_color=(st.session_state["heygen_bg"] or "").strip() or None,
                 )
 
@@ -1655,6 +1775,37 @@ news_name = news_col3.text_input("Name of founder/creator (optional)", value="",
 colg = st.columns([1, 1, 2, 2])
 clicked_generate = colg[0].button("Generate", type="primary", use_container_width=True, key="btn_generate_topic")
 clicked_news = colg[1].button("Find News", use_container_width=True, key="btn_find_news")
+
+# --- Upload news TXT (optional) ---
+with st.expander("Upload news list (.txt)", expanded=False):
+    uploaded_news_file = st.file_uploader("Upload TXT", type=["txt"], key="news_upload_txt")
+    parsed_items: List[Dict[str, Any]] = []
+    if uploaded_news_file is not None:
+        try:
+            raw_txt = uploaded_news_file.read().decode("utf-8", errors="ignore")
+            parsed_items = parse_uploaded_news_txt(raw_txt)
+            st.caption(f"Parsed {len(parsed_items)} item(s) from upload.")
+            if parsed_items:
+                st.dataframe(parsed_items, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Could not parse upload: {e}")
+
+    colu1, _ = st.columns([1, 3])
+    add_uploaded = colu1.button(
+        "Add uploaded news to list",
+        type="primary",
+        use_container_width=True,
+        key="btn_add_uploaded_news",
+        disabled=not parsed_items,
+    )
+    if add_uploaded and parsed_items:
+        existing = st.session_state.get("last_news_items") or []
+        merged = merge_news_items(existing, parsed_items)
+        st.session_state["last_news_items"] = merged
+        st.session_state["last_news_mode"] = st.session_state.get("last_news_mode") or "Uploaded"
+        st.session_state["last_news_range"] = st.session_state.get("last_news_range") or "Custom"
+        st.session_state["last_news_name"] = st.session_state.get("last_news_name") or ""
+        st.rerun()
 
 # -------------------------------
 # Topic generate flow
