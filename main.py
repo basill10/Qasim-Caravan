@@ -2494,8 +2494,9 @@ def render_thumbnail_section():
         key="thumb_user_image_uploader",
     )
     if uploaded_file is not None:
-        st.session_state["thumb_pending_main_image"] = uploaded_file.read()
-        st.rerun()
+        st.session_state["thumb_main_image_bytes"] = uploaded_file.getvalue()
+        st.session_state["thumb_final_thumbnail_bytes"] = None
+        st.success("Uploaded image stored for final thumbnail.")
 
     if st.session_state.get("thumb_main_image_bytes"):
         st.markdown("#### Current main image preview")
