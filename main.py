@@ -36,6 +36,7 @@ import re
 import json
 import time
 import hashlib
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
@@ -44,6 +45,12 @@ import numpy as np
 import requests
 import streamlit as st
 from openai import OpenAI
+try:
+    from google import genai  # type: ignore
+    from google.genai import types  # type: ignore
+except Exception:
+    genai = None
+    types = None
 from datetime import datetime, timedelta
 
 
@@ -133,9 +140,14 @@ DEFAULT_VECTOR_STORE_DIR = Path(os.getenv("VECTOR_STORE_DIR", ".vector_store"))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
+THUMB_TEMPLATE_DIR = Path(os.getenv("THUMB_TEMPLATE_DIR", Path(__file__).parent))
 
 TAVILY_API_KEY_ENV = os.getenv("TAVILY_API_KEY")
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
+
+GOOGLE_CSE_API_KEY_ENV = os.getenv("GOOGLE_CSE_API_KEY")
+GOOGLE_CSE_CX_ENV = os.getenv("GOOGLE_CSE_CX")
+GEMINI_API_KEY_ENV = os.getenv("GEMINI_API_KEY")
 
 # --- ElevenLabs ---
 ELEVEN_API_KEY_ENV = os.getenv("ELEVENLABS_API_KEY", "")
@@ -154,6 +166,22 @@ def sha256_bytes(data: bytes) -> str:
     h = hashlib.sha256()
     h.update(data)
     return h.hexdigest()
+
+def get_secret(name: str) -> Optional[str]:
+    """
+    Priority:
+    1) OS environment variables
+    2) Streamlit secrets (if configured)
+    """
+    val = os.getenv(name)
+    if val:
+        return val
+    try:
+        if name in st.secrets:
+            return st.secrets[name]  # type: ignore[index]
+    except Exception:
+        return None
+    return None
 
 
 def normalize_text(s: str) -> str:
@@ -281,6 +309,360 @@ def merge_news_items(existing: List[Dict[str, Any]], new_items: List[Dict[str, A
         seen.add(key)
         merged.append(it)
     return merged
+
+
+# -------------------------------
+# Thumbnail helpers
+# -------------------------------
+def cse_image_search(
+    api_key: str,
+    cx: str,
+    query: str,
+    *,
+    start: int = 1,
+    num: int = 10,
+    safe: str = "active",
+) -> List[Dict[str, str]]:
+    if not api_key or not cx:
+        raise RuntimeError("Google CSE API key or CX missing.")
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": api_key,
+        "cx": cx,
+        "q": query,
+        "searchType": "image",
+        "start": start,
+        "num": min(max(1, num), 10),
+        "safe": safe,
+        "imgType": "photo",
+    }
+    r = requests.get(endpoint, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json() or {}
+    out: List[Dict[str, str]] = []
+    for it in (data.get("items") or []):
+        img = it.get("image") or {}
+        out.append(
+            {
+                "original": it.get("link") or "",
+                "thumbnail": img.get("thumbnailLink") or it.get("link") or "",
+                "source": img.get("contextLink") or it.get("link") or "",
+                "title": it.get("title") or query,
+            }
+        )
+    return out
+
+
+def _openai_json_response(
+    client: OpenAI,
+    *,
+    model: str,
+    system: str,
+    user: str,
+) -> Dict[str, Any]:
+    if is_gpt5(model):
+        resp = client.responses.create(
+            model=model,
+            input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            text={"format": {"type": "json_object"}, "verbosity": "medium"},
+            reasoning={"effort": "medium", "summary": "auto"},
+        )
+        content = _extract_text_from_responses(resp)
+    else:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=600,
+        )
+        content = resp.choices[0].message.content
+
+    data = _safe_json_load(content or "")
+    return data if isinstance(data, dict) else {}
+
+
+def generate_heading_from_transcript(client: OpenAI, transcript: str) -> Optional[Dict[str, str]]:
+    if not transcript.strip():
+        return None
+
+    system_msg = (
+        "You are a copywriter for a Pakistani business/tech brand. "
+        "You write 2-part thumbnail headings for Instagram carousels and short videos. "
+        "Your output must be JSON with keys 'subheading' and 'main_heading'. "
+        "Tone: sharp, high-impact, concise, story-driven, serious but energetic."
+    )
+
+    examples_block = """
+Here are three examples of the style, tone, and format:
+
+Example 1:
+Subheading:
+The flavour of generations
+Main Heading:
+shezan became the taste of pakistan
+Transcript:
+It’s the mango bottle many Pakistanis grew up with— but Shezaan began as more than a drink.
+
+The name was on Lahore’s dining scene in the late ’50s; by 1964, the Shahnawaaz Group launched Shezaan International as a JV with an American partner. In 1965, they set up a fruit-processing plant in Lahore to bottle orange, adding mango by 1967. 
+
+Scale followed quickly: a Karachi unit in 1981 to serve Sindh and exports, an independent Tetra Brik line in 1987, and a juice factory in 1990. 
+
+Parallel to the juices, Lahore got a hometown staple: Shezaan Bakers opened its first outlet in 1975 and today runs a network of bakery outlets across the city. Patties at tea-time, birthday cakes, wedding sweets— a ritual for generations. 
+
+The brand spread abroad with pallets of ketchup, jams, and mango drinks— Shezaan products now ship to 40+ countries, carrying a taste of home to diaspora aisles. 
+
+Today, Shezaan runs plants in Lahore, Karachi, and Hattar, pushing classic lines like Mango, All Pure, and sauces through national distribution. 
+
+In FY25, it posted Rs 9.18 billion in sales and swung back to profit— proof the legacy label still moves with the market. 
+
+From school canteens to iftar tables to motorway stops— Shezaan became a flavor of everyday Pakistan.
+
+Example 2:
+Subheading:
+built on affordability and trust
+Main Heading:
+imtiaz changed retail forever
+Transcript:
+From a one-room kiryaana in Karachi to Pakistan’s most-watched supermarket story. This is Imtiaaz — and the retailer who scaled it, Imtiaaz Hussain.
+
+In 1955, his father Hakeem Khan  opened a small corner shop in Karachi. The son kept the name, and rebuilt the model.
+
+He bet on trust with suppliers, tight inventory, and everyday low prices. First came bigger aisles and self-service. Then the shift to multi-format retail.
+
+Imtiaaz launched Super and Mega — from neighborhood convenience to hypermarket scale. Private labels followed. A loyalty program turned walk-ins into repeat families.
+
+The 2010s took it beyond Karachi — into Punjab. Back-end operations and the supply chain scaled to feed dozens of stores, daily.
+
+During lockdowns, it leaned on phone orders and e-commerce pilots to keep households stocked. The local shop mindset — but digitized.
+
+By 2024, Imtiaaz was operating 31 stores across 13 cities. A team of 14,000 served over a million customers a day. Independent estimates placed annual revenue between PKR 60–70 billion.
+
+What stayed constant was the floor discipline: fast turns, wide assortments, sharp pricing. What changed was scale.
+
+From ledger books to ERP dashboards. From one cash counter to national brand power.
+
+Imtiaz isn’t just a chain — it’s a playbook for Pakistani retail. Proof that a homegrown local shop can grow up without losing its edge on price, service, and trust.
+
+Example 3:
+Subheading:
+Pakistani founders web3 bet
+Main Heading:
+Myco’s global streaming wave
+Transcript:
+He turned watch time into income. This is Myco — founded by Umair Usmani. 
+
+Myco is a Web3 streaming platform featuring a watch-and-earn model that rewards viewers and uses a decentralized revenue-sharing framework that benefits creators. 
+
+The numbers travel fast. 20 million users in 18 months, 100 million monthly video impressions, and users in 100+ countries. 
+And Pakistan remains a key market — for growth and audience engagement. 
+
+2025 was the breakthrough. Myco won the global finale of Meet the Drapers, securing a package reported at roughly $1.5M—including a $1M SaaS services contract—reported as the season’s top deal.
+
+Sports powered the flywheel. In 2025, Myco engaged fans around PSL 10 with watch-and-earn rewards across its mobile, TV apps, and web experience. 
+Beyond cricket, the slate spans MMA, squash, padel, and regional entertainment. 
+
+The roadmap stays bold — expanding across MENA, North America, and South Asia, targeting 50M+ users by end-2025 through telco and media partnerships.
+
+A Pakistani founder, a global play. Turning viewers into participants—and attention into an economy.
+"""
+
+    user_prompt = f"""{examples_block}
+
+Now, given the following transcript, write a new subheading and main heading in the same tone and structure, both in ALL CAPS:
+
+Transcript:
+<<<
+{transcript}
+>>>
+
+Rules:
+- Output MUST be valid JSON.
+- Keys: "subheading" and "main_heading".
+- Subheading: short, 3–7 words.
+- Main heading: bold, 5–10 words, all lowercase except brand names.
+- Do NOT include any explanations or extra text, only JSON.
+"""
+
+    data = _openai_json_response(
+        client,
+        model="gpt-5-nano",
+        system=system_msg,
+        user=user_prompt,
+    )
+    sub = (data.get("subheading") or "").strip()
+    main = (data.get("main_heading") or "").strip()
+    if not sub or not main:
+        return None
+    return {"subheading": sub, "main_heading": main}
+
+
+def analyze_visual_concept(client: OpenAI, transcript: str) -> Optional[Dict[str, str]]:
+    if not transcript.strip():
+        return None
+
+    system_msg = (
+        "You analyze transcripts of short videos and decide what is the best visual for a YouTube/Instagram thumbnail. "
+        "You respond ONLY with JSON."
+    )
+    user_prompt = f"""
+Transcript:
+<<<
+{transcript}
+>>>
+
+Decide the thumbnail concept.
+
+Rules:
+1. If the transcript clearly centers around a specific PERSON or a specific PLACE/INSTITUTION:
+   - Set "mode" to "entity".
+   - Set "entity_name" to exactly that person or place name.
+   - Set "thumbnail_prompt" to an empty string.
+
+2. Otherwise:
+   - Set "mode" to "prompt".
+   - Set "entity_name" to an empty string.
+   - Set "thumbnail_prompt" to a bold, cinematic, visually clear description suitable for a thumbnail (no text overlays, just imagery).
+
+3. Output MUST be valid JSON with keys: "mode", "entity_name", "thumbnail_prompt".
+4. Do not add any explanations. JSON only.
+"""
+
+    data = _openai_json_response(
+        client,
+        model="gpt-5-nano",
+        system=system_msg,
+        user=user_prompt,
+    )
+    return {
+        "mode": (data.get("mode") or "").strip(),
+        "entity_name": (data.get("entity_name") or "").strip(),
+        "thumbnail_prompt": (data.get("thumbnail_prompt") or "").strip(),
+    }
+
+
+def generate_ai_image(client: OpenAI, prompt: str) -> Optional[bytes]:
+    if not prompt.strip():
+        return None
+    try:
+        result = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024",
+        )
+        image_base64 = result.data[0].b64_json
+        return base64.b64decode(image_base64)
+    except Exception as e:
+        st.error(f"Error generating AI image: {e}")
+        return None
+
+
+def compose_thumbnail_with_gemini(
+    gemini_client,
+    base_color: str,
+    subheading: str,
+    main_heading: str,
+    main_image_bytes: bytes,
+) -> Optional[bytes]:
+    if not gemini_client or not types:
+        st.error("Gemini client not configured.")
+        return None
+
+    color_to_filename = {
+        "Blue": "blue.png",
+        "Black": "black.png",
+        "White": "white.png",
+    }
+    template_name = color_to_filename.get(base_color)
+    template_path = (THUMB_TEMPLATE_DIR / template_name) if template_name else None
+    if not template_path or not template_path.exists():
+        st.error(f"Base template not found for color '{base_color}'. Expected file: {template_name}")
+        return None
+
+    with open(template_path, "rb") as f:
+        base_bytes = f.read()
+
+    instruction = f"""
+You are a thumbnail designer.
+
+You are given:
+1) A base thumbnail template image (first image), in 1080x1920 resolution (width 1080 px, height 1920 px).
+2) A main photo image (second image).
+
+Tasks:
+
+- KEEP THE CANVAS THE SAME:
+  - The final output MUST have exactly the same resolution as the base template: 1080 px wide and 1920 px tall.
+  - Do NOT crop, resize, or change the canvas size of the base template. Use it as the background.
+
+- TEXT:
+  - Replace the existing heading text entirely on the base template with these two lines:
+      Subheading: "{subheading}"
+      Main heading: "{main_heading}"
+  - Both should be in ALL CAPS
+  - Keep font size, weight, and color similar to the original heading style.
+  - Keep the shadows and glows around the text 
+  - Place the subheading as a smaller line above, and the main heading as a large, bold line below.
+
+- MAIN IMAGE (FOREGROUND SUBJECT):
+  - From the second image, REMOVE the background where possible and isolate the main subject/person/object.
+  - Place the cut-out subject onto the template in the main image/photo area.
+  - Avoid visible rectangular borders or white boxes around the subject.
+  - Preserve a clean, professional compositing with soft or natural edges.
+
+- OVERALL:
+  - Keep the base template layout, colors, logos, and framing intact.
+  - Ensure the final image looks like a polished social media thumbnail.
+Return a single finished thumbnail image.
+""".strip()
+
+    try:
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(text=instruction),
+                    types.Part.from_bytes(
+                        data=base_bytes,
+                        mime_type="image/png",
+                    ),
+                    types.Part.from_bytes(
+                        data=main_image_bytes,
+                        mime_type="image/png",
+                    ),
+                ],
+            )
+        ]
+
+        generate_content_config = types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+        )
+
+        response = gemini_client.models.generate_content(
+            model="gemini-3-pro-image-preview",
+            contents=contents,
+            config=generate_content_config,
+        )
+
+        if getattr(response, "parts", None):
+            for part in response.parts:
+                if getattr(part, "inline_data", None) and part.inline_data.data:
+                    return part.inline_data.data
+
+        if (
+            getattr(response, "candidates", None)
+            and response.candidates[0].content
+            and response.candidates[0].content.parts
+        ):
+            for part in response.candidates[0].content.parts:
+                if getattr(part, "inline_data", None) and part.inline_data.data:
+                    return part.inline_data.data
+
+        st.error("No inline image data found in Gemini response.")
+        return None
+    except Exception as e:
+        st.error(f"Error composing thumbnail with Gemini: {e}")
+        return None
 
 def _date_range_from_option(opt: str) -> tuple[str, str]:
     """
@@ -416,6 +798,14 @@ def get_openai_client(api_key: str | None) -> OpenAI:
     except Exception as e:
         raise RuntimeError("Could not initialize OpenAI client. Provide a valid OPENAI_API_KEY.") from e
 
+@st.cache_resource(show_spinner=False)
+def get_gemini_client(api_key: str | None):
+    if not api_key or not genai:
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
 
 def embed_texts(client: OpenAI, texts: List[str], embed_model: str) -> np.ndarray:
     embeddings: List[List[float]] = []
@@ -1451,6 +1841,16 @@ with st.sidebar:
         }
     )
 
+    st.divider()
+    # --- Thumbnails ---
+    st.subheader("Thumbnails")
+    gemini_api_key = st.text_input("GEMINI_API_KEY (for thumbnail composer)", value=GEMINI_API_KEY_ENV or "", type="password")
+    st.session_state["gemini_api_key"] = gemini_api_key
+    google_cse_api_key = st.text_input("GOOGLE_CSE_API_KEY (image search)", value=GOOGLE_CSE_API_KEY_ENV or "", type="password")
+    google_cse_cx = st.text_input("GOOGLE_CSE_CX (search engine ID)", value=GOOGLE_CSE_CX_ENV or "")
+    st.session_state["google_cse_api_key"] = google_cse_api_key
+    st.session_state["google_cse_cx"] = google_cse_cx
+
 # Early key tip
 if not st.session_state.get("openai_api_key"):
     st.info("Add your OPENAI_API_KEY in the sidebar to begin.")
@@ -1879,6 +2279,277 @@ def render_video_section():
         st.caption("No HeyGen video yet. Render to preview.")
 
 # -------------------------------
+# Thumbnail UI
+# -------------------------------
+def init_thumbnail_state():
+    defaults = {
+        "thumb_transcript": "",
+        "thumb_heading_sub": "",
+        "thumb_heading_main": "",
+        "thumb_visual_mode": "",
+        "thumb_entity_name": "",
+        "thumb_thumbnail_prompt": "",
+        "thumb_cse_results": [],
+        "thumb_selected_cse_index": 0,
+        "thumb_main_image_bytes": None,
+        "thumb_cse_query": "",
+        "thumb_cse_next_start": 1,
+        "thumb_final_thumbnail_bytes": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def render_thumbnail_section():
+    st.subheader("6) Thumbnail Generator")
+
+    if not st.session_state.get("has_script"):
+        st.caption("Generate a script first.")
+        return
+
+    init_thumbnail_state()
+
+    if "thumb_pending_heading" in st.session_state:
+        data = st.session_state.pop("thumb_pending_heading") or {}
+        st.session_state["thumb_heading_sub"] = data.get("subheading", "")
+        st.session_state["thumb_heading_main"] = data.get("main_heading", "")
+
+    if "thumb_pending_visual" in st.session_state:
+        data = st.session_state.pop("thumb_pending_visual") or {}
+        st.session_state["thumb_visual_mode"] = data.get("mode", "")
+        st.session_state["thumb_entity_name"] = data.get("entity_name", "")
+        st.session_state["thumb_thumbnail_prompt"] = data.get("thumbnail_prompt", "")
+        st.session_state["thumb_cse_results"] = data.get("cse_results", [])
+        st.session_state["thumb_cse_query"] = data.get("cse_query", "")
+        st.session_state["thumb_cse_next_start"] = data.get("cse_next_start", 1)
+
+    if "thumb_pending_main_image" in st.session_state:
+        st.session_state["thumb_main_image_bytes"] = st.session_state.pop("thumb_pending_main_image")
+
+    if "thumb_pending_final" in st.session_state:
+        st.session_state["thumb_final_thumbnail_bytes"] = st.session_state.pop("thumb_pending_final")
+
+    current_script = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
+    if not st.session_state.get("thumb_transcript") and current_script:
+        st.session_state["thumb_transcript"] = current_script
+
+    st.markdown("### Step 1 — Transcript & Heading")
+    transcript = st.text_area(
+        "Paste Instagram video transcript",
+        key="thumb_transcript",
+        height=250,
+    )
+
+    if st.button("Generate Heading", type="primary", key="btn_thumb_generate_heading"):
+        if not transcript.strip():
+            st.warning("Please paste a transcript first.")
+        elif not st.session_state.get("openai_api_key"):
+            st.warning("Add OPENAI_API_KEY in the sidebar to generate headings.")
+        else:
+            try:
+                client = get_openai_client(st.session_state.get("openai_api_key"))
+                with st.spinner("Generating headings…"):
+                    result = generate_heading_from_transcript(client, transcript)
+                if result:
+                    st.session_state["thumb_pending_heading"] = result
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error generating heading: {e}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.text_input(
+            "Subheading",
+            key="thumb_heading_sub",
+            placeholder="Subheading (smaller line on top)",
+        )
+    with col2:
+        st.text_input(
+            "Main Heading",
+            key="thumb_heading_main",
+            placeholder="Main heading (big bold line)",
+        )
+
+    st.markdown("---")
+    st.markdown("### Step 2 — Select / Generate / Upload Main Image")
+
+    if st.button("Analyze Transcript for Visual Concept", key="btn_thumb_analyze"):
+        if not transcript.strip():
+            st.warning("Please paste a transcript first.")
+        elif not st.session_state.get("openai_api_key"):
+            st.warning("Add OPENAI_API_KEY in the sidebar to analyze the visual concept.")
+        else:
+            try:
+                client = get_openai_client(st.session_state.get("openai_api_key"))
+                with st.spinner("Analyzing visual concept…"):
+                    concept = analyze_visual_concept(client, transcript)
+                if concept:
+                    pending = {
+                        "mode": concept.get("mode", ""),
+                        "entity_name": concept.get("entity_name", ""),
+                        "thumbnail_prompt": concept.get("thumbnail_prompt", ""),
+                        "cse_results": [],
+                        "cse_query": "",
+                        "cse_next_start": 1,
+                    }
+                    if concept.get("mode") == "entity":
+                        api_key = st.session_state.get("google_cse_api_key") or GOOGLE_CSE_API_KEY_ENV or ""
+                        cx = st.session_state.get("google_cse_cx") or GOOGLE_CSE_CX_ENV or ""
+                        if api_key and cx and concept.get("entity_name"):
+                            try:
+                                results = cse_image_search(
+                                    api_key,
+                                    cx,
+                                    concept["entity_name"],
+                                    start=1,
+                                    num=6,
+                                )
+                                pending["cse_results"] = results
+                                pending["cse_query"] = concept["entity_name"]
+                                pending["cse_next_start"] = 1 + len(results)
+                            except Exception as e:
+                                st.error(f"Error calling Google Custom Search: {e}")
+                        else:
+                            st.warning("Google CSE keys missing, cannot search images.")
+
+                    st.session_state["thumb_pending_visual"] = pending
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Error analyzing concept: {e}")
+
+    if st.session_state.get("thumb_visual_mode") == "entity" and st.session_state.get("thumb_cse_results"):
+        st.markdown("#### Choose an image from search results")
+        results = st.session_state["thumb_cse_results"]
+        num_cols = 3
+        cols = st.columns(num_cols)
+        for i, item in enumerate(results):
+            col = cols[i % num_cols]
+            with col:
+                if item.get("thumbnail"):
+                    st.image(item["thumbnail"], caption=item.get("title") or "", use_column_width=True)
+                if st.button("Use this image", key=f"thumb_use_img_{i}"):
+                    try:
+                        url = item.get("original") or ""
+                        if not url:
+                            st.error("No image URL found for this result.")
+                            return
+                        resp = requests.get(url, timeout=20)
+                        resp.raise_for_status()
+                        st.session_state["thumb_pending_main_image"] = resp.content
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error downloading image: {e}")
+
+        api_key = st.session_state.get("google_cse_api_key") or GOOGLE_CSE_API_KEY_ENV or ""
+        cx = st.session_state.get("google_cse_cx") or GOOGLE_CSE_CX_ENV or ""
+        if api_key and cx and st.session_state.get("thumb_cse_query"):
+            if st.button("Load more images", key="btn_thumb_load_more"):
+                try:
+                    more = cse_image_search(
+                        api_key,
+                        cx,
+                        st.session_state.get("thumb_cse_query", ""),
+                        start=st.session_state.get("thumb_cse_next_start", 1),
+                        num=6,
+                    )
+                    if more:
+                        st.session_state["thumb_cse_results"].extend(more)
+                        st.session_state["thumb_cse_next_start"] += len(more)
+                        st.rerun()
+                    else:
+                        st.info("No more images found.")
+                except Exception as e:
+                    st.error(f"Error loading more images: {e}")
+
+    if st.session_state.get("thumb_visual_mode") == "prompt":
+        st.markdown("#### AI Image Prompt")
+        st.text_area(
+            "Image prompt for gpt-image-1 (editable)",
+            key="thumb_thumbnail_prompt",
+            height=150,
+        )
+
+        if st.button("Generate AI Image", key="btn_thumb_gen_ai"):
+            prompt = st.session_state.get("thumb_thumbnail_prompt", "").strip()
+            if not prompt:
+                st.warning("Please provide an image prompt.")
+            elif not st.session_state.get("openai_api_key"):
+                st.warning("Add OPENAI_API_KEY in the sidebar to generate an AI image.")
+            else:
+                try:
+                    client = get_openai_client(st.session_state.get("openai_api_key"))
+                    with st.spinner("Generating image…"):
+                        img_bytes = generate_ai_image(client, prompt)
+                    if img_bytes:
+                        st.session_state["thumb_pending_main_image"] = img_bytes
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error generating AI image: {e}")
+
+    st.markdown("#### Or upload an image from your computer")
+    uploaded_file = st.file_uploader(
+        "Upload a PNG/JPG/JPEG/WEBP image",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="thumb_user_image_uploader",
+    )
+    if uploaded_file is not None:
+        st.session_state["thumb_pending_main_image"] = uploaded_file.read()
+        st.rerun()
+
+    if st.session_state.get("thumb_main_image_bytes"):
+        st.markdown("#### Current main image preview")
+        st.image(st.session_state["thumb_main_image_bytes"], use_column_width=True)
+
+    st.markdown("---")
+    st.markdown("### Step 3 — Compose Final Thumbnail")
+
+    base_color = st.radio(
+        "Select background color / template",
+        options=["Blue", "Black", "White"],
+        horizontal=True,
+        key="thumb_base_color",
+    )
+
+    ready_for_final = (
+        bool(st.session_state.get("thumb_heading_sub", "").strip())
+        and bool(st.session_state.get("thumb_heading_main", "").strip())
+        and st.session_state.get("thumb_main_image_bytes") is not None
+    )
+
+    if not ready_for_final:
+        st.info("To generate a final thumbnail, you need: a heading (sub + main) and a selected main image.")
+
+    if st.button("Generate Final Thumbnail", type="primary", disabled=not ready_for_final, key="btn_thumb_final"):
+        if ready_for_final:
+            gemini_api_key = st.session_state.get("gemini_api_key") or GEMINI_API_KEY_ENV or ""
+            gemini_client = get_gemini_client(gemini_api_key)
+            if not gemini_client:
+                st.error("Gemini client not configured. Add GEMINI_API_KEY in the sidebar.")
+            else:
+                with st.spinner("Composing thumbnail…"):
+                    final_bytes = compose_thumbnail_with_gemini(
+                        gemini_client,
+                        base_color=base_color,
+                        subheading=st.session_state.get("thumb_heading_sub", ""),
+                        main_heading=st.session_state.get("thumb_heading_main", ""),
+                        main_image_bytes=st.session_state.get("thumb_main_image_bytes"),
+                    )
+                if final_bytes:
+                    st.session_state["thumb_pending_final"] = final_bytes
+                    st.rerun()
+
+    if st.session_state.get("thumb_final_thumbnail_bytes"):
+        st.markdown("#### Final Thumbnail")
+        st.image(st.session_state["thumb_final_thumbnail_bytes"], use_column_width=True)
+        st.download_button(
+            "Download Thumbnail",
+            data=st.session_state["thumb_final_thumbnail_bytes"],
+            file_name="thumbnail_final.png",
+            mime="image/png",
+        )
+
+# -------------------------------
 # 2) Generate a script
 # -------------------------------
 st.subheader("2) Generate a script")
@@ -2247,3 +2918,4 @@ render_script_editor_once()
 render_revision_controls()
 render_voiceover_section()
 render_video_section()
+render_thumbnail_section()
