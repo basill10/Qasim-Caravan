@@ -293,6 +293,8 @@ def upload_file_to_drive(
 ) -> Dict[str, str]:
     if not local_path.exists():
         raise FileNotFoundError(f"File not found: {local_path}")
+    if not local_path.is_file():
+        raise IsADirectoryError(f"Path is not a file: {local_path}")
     if not parent_folder_id:
         raise ValueError("Missing Drive folder id.")
 
@@ -323,6 +325,15 @@ def _drive_preflight() -> Optional[str]:
     if not _drive_deps_ready():
         return "Drive dependencies are not installed (`google-api-python-client`, `google-auth`)."
     return None
+
+def _optional_path(s: object) -> Optional[Path]:
+    if not isinstance(s, str):
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    p = Path(s)
+    return p
 
 
 def is_gpt5(model: str) -> bool:
@@ -2556,8 +2567,8 @@ def render_video_section():
                     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                     suffix = f"-{video_id[:8]}" if video_id else ""
                     base = f"{ts}-{slugify(topic)}{suffix}"
-                    mp4_path = Path(st.session_state.get("last_video_path") or "")
-                    if not (mp4_path and mp4_path.exists()):
+                    mp4_path = _optional_path(st.session_state.get("last_video_path"))
+                    if not (mp4_path and mp4_path.is_file()):
                         mp4_path = DEFAULT_OUTPUT_DIR / f"{base}-video.mp4"
                         try:
                             with st.spinner("Downloading MP4…"):
@@ -2565,8 +2576,8 @@ def render_video_section():
                             st.session_state["last_video_path"] = str(mp4_path)
                         except Exception as e:
                             st.error(f"Failed to download MP4: {e}")
-                            mp4_path = Path()
-                    if mp4_path and mp4_path.exists():
+                            mp4_path = None
+                    if mp4_path and mp4_path.is_file():
                         try:
                             with st.spinner("Uploading MP4 to Google Drive…"):
                                 svc = get_drive_service_from_sa_json(st.session_state["drive_sa_json_bytes"])
@@ -2581,6 +2592,8 @@ def render_video_section():
                             st.toast("Uploaded video to Drive", icon="✅")
                         except Exception as e:
                             st.error(f"Drive upload (video) failed: {e}")
+                    else:
+                        st.error("No local MP4 file available to upload.")
 
         if colu2.button("Upload thumbnail to Google Drive", use_container_width=True, key="btn_drive_upload_thumb_from_video"):
             err = _drive_preflight()
@@ -2588,7 +2601,7 @@ def render_video_section():
                 st.error(err)
             else:
                 thumb_bytes = st.session_state.get("thumb_final_thumbnail_bytes")
-                thumb_path = Path(st.session_state.get("last_thumbnail_path") or "")
+                thumb_path = _optional_path(st.session_state.get("last_thumbnail_path"))
                 if not (thumb_path and thumb_path.exists()) and thumb_bytes:
                     topic = st.session_state.get("last_topic", "") or "reel"
                     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2601,9 +2614,9 @@ def render_video_section():
                         st.session_state["last_thumbnail_path"] = str(thumb_path)
                     except Exception as e:
                         st.error(f"Could not save thumbnail locally: {e}")
-                        thumb_path = Path()
+                        thumb_path = None
 
-                if not (thumb_path and thumb_path.exists()):
+                if not (thumb_path and thumb_path.is_file()):
                     st.error("No thumbnail found to upload. Generate a thumbnail first.")
                 else:
                     try:
@@ -2941,8 +2954,8 @@ def render_thumbnail_section():
                 st.error(err)
             else:
                 thumb_bytes = st.session_state.get("thumb_final_thumbnail_bytes") or b""
-                thumb_path = Path(st.session_state.get("last_thumbnail_path") or "")
-                if not (thumb_path and thumb_path.exists()):
+                thumb_path = _optional_path(st.session_state.get("last_thumbnail_path"))
+                if not (thumb_path and thumb_path.is_file()):
                     topic = st.session_state.get("last_topic", "") or "reel"
                     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                     base = f"{ts}-{slugify(topic)}"
@@ -2954,8 +2967,8 @@ def render_thumbnail_section():
                         st.session_state["last_thumbnail_path"] = str(thumb_path)
                     except Exception as e:
                         st.error(f"Could not save thumbnail locally: {e}")
-                        thumb_path = Path()
-                if not (thumb_path and thumb_path.exists()):
+                        thumb_path = None
+                if not (thumb_path and thumb_path.is_file()):
                     st.error("Thumbnail file missing; please try generating again.")
                 else:
                     try:
