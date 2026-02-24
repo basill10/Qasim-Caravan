@@ -57,10 +57,12 @@ try:
     from google.oauth2 import service_account  # type: ignore
     from googleapiclient.discovery import build  # type: ignore
     from googleapiclient.http import MediaFileUpload  # type: ignore
+    from googleapiclient.errors import HttpError  # type: ignore
 except Exception:
     service_account = None
     build = None
     MediaFileUpload = None
+    HttpError = None
 
 
 # -------------------------------
@@ -262,7 +264,16 @@ def extract_drive_folder_id(url_or_id: str) -> str:
     return ""
 
 def _drive_deps_ready() -> bool:
-    return bool(service_account and build and MediaFileUpload)
+    return bool(service_account and build and MediaFileUpload and HttpError)
+
+def _sa_email_from_json_bytes(sa_json_bytes: Optional[bytes]) -> str:
+    if not sa_json_bytes:
+        return ""
+    try:
+        info = json.loads(sa_json_bytes.decode("utf-8"))
+        return (info.get("client_email") or "").strip()
+    except Exception:
+        return ""
 
 @st.cache_resource(show_spinner=False)
 def get_drive_service_from_sa_json(sa_json_bytes: bytes):
@@ -272,7 +283,14 @@ def get_drive_service_from_sa_json(sa_json_bytes: bytes):
         raise RuntimeError("Service account JSON is empty.")
     info = json.loads(sa_json_bytes.decode("utf-8"))
     creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+    try:
+        timeout_s = int(os.getenv("DRIVE_HTTP_TIMEOUT", "600"))
+        if hasattr(svc, "_http") and getattr(svc._http, "timeout", None) is not None:  # type: ignore[attr-defined]
+            svc._http.timeout = timeout_s  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return svc
 
 def download_url_to_file(url: str, out_path: Path, *, timeout: int = 300) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,24 +316,107 @@ def upload_file_to_drive(
     if not parent_folder_id:
         raise ValueError("Missing Drive folder id.")
 
+    def _is_retryable_exc(e: BaseException) -> bool:
+        if isinstance(e, (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            return True
+        if isinstance(e, OSError) and getattr(e, "errno", None) in (32, 104, 110):  # broken pipe / conn reset / timeout
+            return True
+        if HttpError is not None and isinstance(e, HttpError):
+            try:
+                status = int(getattr(getattr(e, "resp", None), "status", 0))
+            except Exception:
+                status = 0
+            return status in (408, 429) or 500 <= status < 600
+        return False
+
     metadata: Dict[str, Any] = {"name": drive_filename or local_path.name, "parents": [parent_folder_id]}
-    media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
-    created = (
-        drive_service.files()
-        .create(
-            body=metadata,
-            media_body=media,
-            fields="id,name,webViewLink,webContentLink",
-            supportsAllDrives=True,
-        )
-        .execute()
-    )
+
+    # Resumable, chunked upload with retries for flaky connections (e.g., Streamlit Cloud).
+    retries = int(os.getenv("DRIVE_UPLOAD_RETRIES", "5"))
+    chunk_size = int(os.getenv("DRIVE_UPLOAD_CHUNK_SIZE", str(8 * 1024 * 1024)))  # 8MB
+    fields = "id,name,webViewLink,webContentLink"
+
+    created: Optional[Dict[str, Any]] = None
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, retries + 1):
+        progress = None
+        try:
+            media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True, chunksize=chunk_size)
+            request = drive_service.files().create(
+                body=metadata,
+                media_body=media,
+                fields=fields,
+                supportsAllDrives=True,
+            )
+
+            progress = st.progress(0.0, text="Uploading to Google Drive…")
+            response = None
+            while response is None:
+                status, response = request.next_chunk()
+                if status is not None:
+                    try:
+                        progress.progress(min(max(float(status.progress()), 0.0), 1.0))
+                    except Exception:
+                        pass
+            try:
+                progress.progress(1.0)
+            except Exception:
+                pass
+            created = response
+            last_exc = None
+            break
+        except BaseException as e:
+            last_exc = e
+            if attempt >= retries or not _is_retryable_exc(e):
+                raise
+            backoff = min(2 ** (attempt - 1), 16)
+            st.warning(f"Drive upload interrupted ({type(e).__name__}). Retrying in {backoff}s… (attempt {attempt}/{retries})")
+            time.sleep(backoff)
+        finally:
+            try:
+                if progress is not None:
+                    progress.empty()
+            except Exception:
+                pass
+
+    if created is None:
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Drive upload failed without an exception.")
     return {
         "id": created.get("id") or "",
         "name": created.get("name") or (drive_filename or local_path.name),
         "webViewLink": created.get("webViewLink") or "",
         "webContentLink": created.get("webContentLink") or "",
     }
+
+def drive_check_folder_access(drive_service, folder_id: str) -> tuple[bool, str]:
+    if not folder_id:
+        return False, "Drive folder ID is empty."
+    try:
+        meta = (
+            drive_service.files()
+            .get(
+                fileId=folder_id,
+                fields="id,name,mimeType",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except Exception as e:
+        if HttpError is not None and isinstance(e, HttpError):
+            try:
+                status = int(getattr(getattr(e, "resp", None), "status", 0))
+            except Exception:
+                status = 0
+            if status == 404:
+                return False, f"Drive folder not found / not shared with this service account: {folder_id}"
+        return False, f"Drive folder check failed: {e}"
+
+    if (meta.get("mimeType") or "") != "application/vnd.google-apps.folder":
+        return False, f"Drive ID is not a folder: {folder_id}"
+    name = (meta.get("name") or "").strip() or folder_id
+    return True, f"Drive folder OK: {name}"
 
 def _drive_preflight() -> Optional[str]:
     if not st.session_state.get("drive_folder_id"):
@@ -324,6 +425,19 @@ def _drive_preflight() -> Optional[str]:
         return "Service account JSON is missing (set it in Streamlit secrets or upload it in the sidebar)."
     if not _drive_deps_ready():
         return "Drive dependencies are not installed (`google-api-python-client`, `google-auth`)."
+    try:
+        svc = get_drive_service_from_sa_json(st.session_state["drive_sa_json_bytes"])
+        ok, msg = drive_check_folder_access(svc, st.session_state["drive_folder_id"])
+        if not ok:
+            email = _sa_email_from_json_bytes(st.session_state.get("drive_sa_json_bytes"))
+            extra = f" (service account: {email})" if email else ""
+            return (
+                msg
+                + extra
+                + ". Share the folder with the service account email (Editor). If this is a Shared Drive, add the service account as a member."
+            )
+    except Exception as e:
+        return f"Drive setup check failed: {e}"
     return None
 
 def _optional_path(s: object) -> Optional[Path]:
@@ -2056,6 +2170,20 @@ with st.sidebar:
         if not _drive_deps_ready():
             st.warning("Drive deps missing. Add `google-api-python-client` and `google-auth` to requirements.")
         st.caption("Make sure the Drive folder is shared with the service account email (Editor).")
+        if st.button("Test Drive access", use_container_width=True, key="btn_drive_test_access"):
+            err = _drive_preflight()
+            if err:
+                st.error(err)
+            else:
+                try:
+                    svc = get_drive_service_from_sa_json(st.session_state["drive_sa_json_bytes"])
+                    ok, msg = drive_check_folder_access(svc, st.session_state["drive_folder_id"])
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                except Exception as e:
+                    st.error(f"Drive access test failed: {e}")
 
 # Early key tip
 if not st.session_state.get("openai_api_key"):
@@ -2513,15 +2641,12 @@ def render_video_section():
             if st.session_state.get("drive_enabled"):
                 already = st.session_state.get("drive_uploaded_video_id")
                 if already != video_id:
-                    folder_id = (st.session_state.get("drive_folder_id") or "").strip()
-                    sa_json_bytes = st.session_state.get("drive_sa_json_bytes")
-                    if not folder_id:
-                        st.warning("Drive upload is enabled, but Drive folder ID is missing.")
-                    elif not sa_json_bytes:
-                        st.warning("Drive upload is enabled, but service account JSON is missing.")
-                    elif not _drive_deps_ready():
-                        st.warning("Drive upload is enabled, but Drive dependencies are not installed.")
+                    err = _drive_preflight()
+                    if err:
+                        st.warning(err)
                     else:
+                        folder_id = (st.session_state.get("drive_folder_id") or "").strip()
+                        sa_json_bytes = st.session_state.get("drive_sa_json_bytes")
                         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                         topic = st.session_state.get("last_topic", "") or "reel"
                         base = f"{ts}-{slugify(topic)}"
@@ -2915,32 +3040,30 @@ def render_thumbnail_section():
                     if st.session_state.get("drive_enabled"):
                         thumb_hash = sha256_bytes(final_bytes)
                         already = st.session_state.get("drive_uploaded_thumbnail_hash")
-                        folder_id = (st.session_state.get("drive_folder_id") or "").strip()
-                        sa_json_bytes = st.session_state.get("drive_sa_json_bytes")
                         if already == thumb_hash:
                             pass
-                        elif not folder_id:
-                            st.warning("Drive upload is enabled, but Drive folder ID is missing.")
-                        elif not sa_json_bytes:
-                            st.warning("Drive upload is enabled, but service account JSON is missing.")
-                        elif not _drive_deps_ready():
-                            st.warning("Drive upload is enabled, but Drive dependencies are not installed.")
                         else:
-                            try:
-                                with st.spinner("Uploading thumbnail to Google Drive…"):
-                                    svc = get_drive_service_from_sa_json(sa_json_bytes)
-                                    info = upload_file_to_drive(
-                                        svc,
-                                        local_path=png_path,
-                                        parent_folder_id=folder_id,
-                                        mime_type="image/png",
-                                        drive_filename=png_path.name,
-                                    )
-                                st.session_state["drive_uploaded_thumbnail_hash"] = thumb_hash
-                                st.session_state["drive_uploaded_thumbnail_info"] = info
-                                st.toast("Uploaded thumbnail to Drive", icon="✅")
-                            except Exception as e:
-                                st.error(f"Drive upload (thumbnail) failed: {e}")
+                            err = _drive_preflight()
+                            if err:
+                                st.warning(err)
+                            else:
+                                folder_id = (st.session_state.get("drive_folder_id") or "").strip()
+                                sa_json_bytes = st.session_state.get("drive_sa_json_bytes")
+                                try:
+                                    with st.spinner("Uploading thumbnail to Google Drive…"):
+                                        svc = get_drive_service_from_sa_json(sa_json_bytes)
+                                        info = upload_file_to_drive(
+                                            svc,
+                                            local_path=png_path,
+                                            parent_folder_id=folder_id,
+                                            mime_type="image/png",
+                                            drive_filename=png_path.name,
+                                        )
+                                    st.session_state["drive_uploaded_thumbnail_hash"] = thumb_hash
+                                    st.session_state["drive_uploaded_thumbnail_info"] = info
+                                    st.toast("Uploaded thumbnail to Drive", icon="✅")
+                                except Exception as e:
+                                    st.error(f"Drive upload (thumbnail) failed: {e}")
 
                     st.session_state["thumb_pending_final"] = final_bytes
                     st.rerun()
