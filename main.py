@@ -2262,10 +2262,6 @@ def render_voiceover_section():
         st.caption("Generate a script first.")
         return
 
-    if not st.session_state.get("openai_api_key"):
-        st.info("Add OPENAI_API_KEY in the sidebar to enable Urdu script conversion before TTS.")
-        return
-
     if not st.session_state.get("eleven_api_key"):
         st.info("Add ELEVENLABS_API_KEY in the sidebar to enable audio generation.")
         return
@@ -2281,14 +2277,46 @@ def render_voiceover_section():
     current_script = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
     current_hash = sha256_bytes(current_script.encode("utf-8")) if current_script else ""
 
-    c1, c2, _ = st.columns([1, 1, 2])
-    convert_btn = c1.button("Convert to Urdu Script", type="primary", use_container_width=True, key="btn_convert_urdu")
-    reconvert_btn = c2.button("Reconvert", use_container_width=True, key="btn_reconvert_urdu")
-    do_convert = convert_btn or reconvert_btn
+    tts_mode = st.radio(
+        "TTS transcript source",
+        options=["As-is (use script)", "Urdu script (optional conversion)"],
+        horizontal=True,
+        key="tts_mode",
+    )
+    wants_urdu = tts_mode.startswith("Urdu")
+
+    if wants_urdu and not st.session_state.get("openai_api_key"):
+        st.info("Add OPENAI_API_KEY in the sidebar to enable Urdu script conversion (optional).")
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    if wants_urdu:
+        convert_btn = c1.button(
+            "Convert to Urdu Script",
+            type="primary",
+            use_container_width=True,
+            key="btn_convert_urdu",
+            disabled=not bool(st.session_state.get("openai_api_key")),
+        )
+        reconvert_btn = c2.button(
+            "Reconvert",
+            use_container_width=True,
+            key="btn_reconvert_urdu",
+            disabled=not bool(st.session_state.get("openai_api_key")),
+        )
+        do_convert = convert_btn or reconvert_btn
+    else:
+        do_convert = False
+        reset_btn = c1.button("Use current script", use_container_width=True, key="btn_tts_use_script")
+        if reset_btn or st.session_state.get("tts_source_kind") != "script" or not (st.session_state.get("tts_ready_text") or "").strip():
+            st.session_state["tts_ready_text"] = current_script
+            st.session_state["tts_source_hash"] = current_hash
+            st.session_state["tts_source_kind"] = "script"
 
     if do_convert:
         if not current_script.strip():
             st.warning("No script to convert yet.")
+        elif not st.session_state.get("openai_api_key"):
+            st.warning("Add OPENAI_API_KEY in the sidebar to convert to Urdu script.")
         else:
             try:
                 client = get_openai_client(st.session_state.get("openai_api_key"))
@@ -2304,36 +2332,41 @@ def render_voiceover_section():
 
                 st.session_state["pending_tts_text"] = converted
                 st.session_state["pending_tts_source_hash"] = key
+                st.session_state["tts_source_kind"] = "urdu"
                 st.session_state["last_tts_text"] = converted
                 st.toast("Urdu transcript ready", icon="📝")
                 st.rerun()
             except Exception as e:
                 st.error(f"Conversion failed: {e}")
 
-    if st.session_state.get("tts_ready_text"):
-        st.text_area(
-            "Urdu transcript (editable, used for TTS)",
-            key="tts_ready_text",
-            height=240,
-        )
-    else:
-        st.caption("Click “Convert to Urdu Script” to generate the TTS transcript.")
+    label = "TTS transcript (editable, used for TTS)"
+    if wants_urdu:
+        label = "Urdu transcript (editable, used for TTS)"
+    st.text_area(label, key="tts_ready_text", height=240)
+    if wants_urdu and not (st.session_state.get("tts_ready_text") or "").strip():
+        st.caption("Click “Convert to Urdu Script” to generate the TTS transcript (or switch to As-is).")
 
     tts_ready_text = st.session_state.get("tts_ready_text") or ""
     tts_source_hash = st.session_state.get("tts_source_hash") or ""
+    tts_source_kind = st.session_state.get("tts_source_kind") or ""
     stale_conversion = bool(tts_ready_text and tts_source_hash and tts_source_hash != current_hash)
-    if stale_conversion:
+    if wants_urdu and tts_source_kind == "urdu" and stale_conversion:
         st.warning("The script has changed since conversion. Please reconvert before generating audio.")
+    elif (not wants_urdu) and tts_source_kind == "script" and stale_conversion:
+        st.caption("The script has changed since you last loaded it here. Click “Use current script” to refresh.")
 
-    c3, c4, _ = st.columns([1, 1, 2])
-    make_audio = c3.button("Generate Audio", type="primary", use_container_width=True, key="btn_make_audio")
-    regen_audio = c4.button("Regenerate", use_container_width=True, key="btn_regen_audio")
+    c4, c5, _ = st.columns([1, 1, 2])
+    make_audio = c4.button("Generate Audio", type="primary", use_container_width=True, key="btn_make_audio")
+    regen_audio = c5.button("Regenerate", use_container_width=True, key="btn_regen_audio")
     do_tts = make_audio or regen_audio
 
     if do_tts:
         if not tts_ready_text.strip():
-            st.error("Please convert to Urdu script first.")
-        elif stale_conversion:
+            if wants_urdu:
+                st.error("Please convert to Urdu script first (or switch to As-is).")
+            else:
+                st.error("TTS transcript is empty.")
+        elif wants_urdu and tts_source_kind == "urdu" and stale_conversion:
             st.error("Please reconvert after script changes.")
         else:
             try:
