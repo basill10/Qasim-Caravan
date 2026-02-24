@@ -315,6 +315,15 @@ def upload_file_to_drive(
         "webContentLink": created.get("webContentLink") or "",
     }
 
+def _drive_preflight() -> Optional[str]:
+    if not st.session_state.get("drive_folder_id"):
+        return "Drive folder ID is missing (set it in the sidebar)."
+    if not st.session_state.get("drive_sa_json_bytes"):
+        return "Service account JSON is missing (set it in Streamlit secrets or upload it in the sidebar)."
+    if not _drive_deps_ready():
+        return "Drive dependencies are not installed (`google-api-python-client`, `google-auth`)."
+    return None
+
 
 def is_gpt5(model: str) -> bool:
     return model and model.strip().lower().startswith("gpt-5")
@@ -2509,6 +2518,7 @@ def render_video_section():
                         try:
                             with st.spinner("Downloading MP4…"):
                                 download_url_to_file(video_url, mp4_path, timeout=600)
+                            st.session_state["last_video_path"] = str(mp4_path)
                             with st.spinner("Uploading MP4 to Google Drive…"):
                                 svc = get_drive_service_from_sa_json(sa_json_bytes)
                                 info = upload_file_to_drive(
@@ -2530,6 +2540,87 @@ def render_video_section():
     if st.session_state.get("heygen_video_url"):
         st.video(st.session_state["heygen_video_url"])
         st.link_button("Open video in new tab", st.session_state["heygen_video_url"], use_container_width=True)
+
+        colu1, colu2, _ = st.columns([1, 1, 2])
+        if colu1.button("Upload video to Google Drive", use_container_width=True, key="btn_drive_upload_video"):
+            err = _drive_preflight()
+            if err:
+                st.error(err)
+            else:
+                video_url = st.session_state.get("heygen_video_url") or ""
+                if not video_url:
+                    st.error("No video_url available to upload.")
+                else:
+                    video_id = (st.session_state.get("heygen_video_id") or "").strip()
+                    topic = st.session_state.get("last_topic", "") or "reel"
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    suffix = f"-{video_id[:8]}" if video_id else ""
+                    base = f"{ts}-{slugify(topic)}{suffix}"
+                    mp4_path = Path(st.session_state.get("last_video_path") or "")
+                    if not (mp4_path and mp4_path.exists()):
+                        mp4_path = DEFAULT_OUTPUT_DIR / f"{base}-video.mp4"
+                        try:
+                            with st.spinner("Downloading MP4…"):
+                                download_url_to_file(video_url, mp4_path, timeout=600)
+                            st.session_state["last_video_path"] = str(mp4_path)
+                        except Exception as e:
+                            st.error(f"Failed to download MP4: {e}")
+                            mp4_path = Path()
+                    if mp4_path and mp4_path.exists():
+                        try:
+                            with st.spinner("Uploading MP4 to Google Drive…"):
+                                svc = get_drive_service_from_sa_json(st.session_state["drive_sa_json_bytes"])
+                                info = upload_file_to_drive(
+                                    svc,
+                                    local_path=mp4_path,
+                                    parent_folder_id=st.session_state["drive_folder_id"],
+                                    mime_type="video/mp4",
+                                    drive_filename=mp4_path.name,
+                                )
+                            st.session_state["drive_uploaded_video_info"] = info
+                            st.toast("Uploaded video to Drive", icon="✅")
+                        except Exception as e:
+                            st.error(f"Drive upload (video) failed: {e}")
+
+        if colu2.button("Upload thumbnail to Google Drive", use_container_width=True, key="btn_drive_upload_thumb_from_video"):
+            err = _drive_preflight()
+            if err:
+                st.error(err)
+            else:
+                thumb_bytes = st.session_state.get("thumb_final_thumbnail_bytes")
+                thumb_path = Path(st.session_state.get("last_thumbnail_path") or "")
+                if not (thumb_path and thumb_path.exists()) and thumb_bytes:
+                    topic = st.session_state.get("last_topic", "") or "reel"
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    base = f"{ts}-{slugify(topic)}"
+                    thumb_path = DEFAULT_OUTPUT_DIR / f"{base}-thumbnail.png"
+                    try:
+                        thumb_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(thumb_path, "wb") as f:
+                            f.write(thumb_bytes)
+                        st.session_state["last_thumbnail_path"] = str(thumb_path)
+                    except Exception as e:
+                        st.error(f"Could not save thumbnail locally: {e}")
+                        thumb_path = Path()
+
+                if not (thumb_path and thumb_path.exists()):
+                    st.error("No thumbnail found to upload. Generate a thumbnail first.")
+                else:
+                    try:
+                        with st.spinner("Uploading thumbnail to Google Drive…"):
+                            svc = get_drive_service_from_sa_json(st.session_state["drive_sa_json_bytes"])
+                            info = upload_file_to_drive(
+                                svc,
+                                local_path=thumb_path,
+                                parent_folder_id=st.session_state["drive_folder_id"],
+                                mime_type="image/png",
+                                drive_filename=thumb_path.name,
+                            )
+                        st.session_state["drive_uploaded_thumbnail_info"] = info
+                        st.toast("Uploaded thumbnail to Drive", icon="✅")
+                    except Exception as e:
+                        st.error(f"Drive upload (thumbnail) failed: {e}")
+
         info = st.session_state.get("drive_uploaded_video_info") or {}
         if info.get("webViewLink"):
             st.link_button("Open uploaded video in Drive", info["webViewLink"], use_container_width=True)
@@ -2844,6 +2935,43 @@ def render_thumbnail_section():
     if st.session_state.get("thumb_final_thumbnail_bytes"):
         st.markdown("#### Final Thumbnail")
         st.image(st.session_state["thumb_final_thumbnail_bytes"], use_column_width=True)
+        if st.button("Upload thumbnail to Google Drive", use_container_width=True, key="btn_drive_upload_thumbnail"):
+            err = _drive_preflight()
+            if err:
+                st.error(err)
+            else:
+                thumb_bytes = st.session_state.get("thumb_final_thumbnail_bytes") or b""
+                thumb_path = Path(st.session_state.get("last_thumbnail_path") or "")
+                if not (thumb_path and thumb_path.exists()):
+                    topic = st.session_state.get("last_topic", "") or "reel"
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    base = f"{ts}-{slugify(topic)}"
+                    thumb_path = DEFAULT_OUTPUT_DIR / f"{base}-thumbnail.png"
+                    try:
+                        thumb_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(thumb_path, "wb") as f:
+                            f.write(thumb_bytes)
+                        st.session_state["last_thumbnail_path"] = str(thumb_path)
+                    except Exception as e:
+                        st.error(f"Could not save thumbnail locally: {e}")
+                        thumb_path = Path()
+                if not (thumb_path and thumb_path.exists()):
+                    st.error("Thumbnail file missing; please try generating again.")
+                else:
+                    try:
+                        with st.spinner("Uploading thumbnail to Google Drive…"):
+                            svc = get_drive_service_from_sa_json(st.session_state["drive_sa_json_bytes"])
+                            info = upload_file_to_drive(
+                                svc,
+                                local_path=thumb_path,
+                                parent_folder_id=st.session_state["drive_folder_id"],
+                                mime_type="image/png",
+                                drive_filename=thumb_path.name,
+                            )
+                        st.session_state["drive_uploaded_thumbnail_info"] = info
+                        st.toast("Uploaded thumbnail to Drive", icon="✅")
+                    except Exception as e:
+                        st.error(f"Drive upload (thumbnail) failed: {e}")
         info = st.session_state.get("drive_uploaded_thumbnail_info") or {}
         if info.get("webViewLink"):
             st.link_button("Open uploaded thumbnail in Drive", info["webViewLink"], use_container_width=True)
