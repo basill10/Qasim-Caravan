@@ -198,6 +198,41 @@ def get_secret(name: str) -> Optional[str]:
         return None
     return None
 
+def get_secret_json_bytes(*names: str) -> Optional[bytes]:
+    """
+    Fetch a JSON object from Streamlit secrets and return it as UTF-8 bytes.
+
+    Supports:
+    - Secret as a JSON string
+    - Secret as a TOML table (dict-like), which we json.dumps
+    """
+    for name in names:
+        if not name:
+            continue
+        try:
+            if name not in st.secrets:  # type: ignore[operator]
+                continue
+            v = st.secrets.get(name)  # type: ignore[attr-defined]
+        except Exception:
+            v = None
+
+        if v is None:
+            continue
+
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                continue
+            return s.encode("utf-8")
+        if isinstance(v, dict):
+            try:
+                return json.dumps(v).encode("utf-8")
+            except Exception:
+                continue
+    return None
+
 
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip())
@@ -1963,6 +1998,7 @@ with st.sidebar:
         help="If running locally, you can point to an on-disk key file instead of uploading it each run.",
     )
     drive_sa_upload = st.file_uploader("Or upload service account JSON key", type=["json"], key="drive_sa_json_uploader")
+    st.caption("Streamlit Cloud: set `DRIVE_SA_JSON` in secrets (JSON string), or `drive_service_account` as a TOML table.")
 
     sa_json_bytes: Optional[bytes] = None
     if drive_sa_upload is not None:
@@ -1974,6 +2010,17 @@ with st.sidebar:
                 sa_json_bytes = p.read_bytes()
         except Exception:
             sa_json_bytes = None
+    else:
+        # Streamlit Cloud-friendly: store the service account JSON in secrets.
+        # Recommended secret names:
+        # - DRIVE_SA_JSON (JSON string) or DRIVE_SERVICE_ACCOUNT_JSON
+        # - drive_service_account (TOML table)
+        sa_json_bytes = get_secret_json_bytes(
+            "DRIVE_SA_JSON",
+            "DRIVE_SERVICE_ACCOUNT_JSON",
+            "drive_service_account",
+            "gcp_service_account",
+        )
 
     st.session_state["drive_sa_json_bytes"] = sa_json_bytes
     if sa_json_bytes:
