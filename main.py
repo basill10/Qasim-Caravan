@@ -1941,8 +1941,7 @@ with st.sidebar:
     st.divider()
     # --- Google Drive upload ---
     st.subheader("Google Drive Upload")
-    drive_enabled = st.toggle("Auto-upload MP4 + thumbnail", value=bool(os.getenv("DRIVE_UPLOAD_ENABLED")), key="drive_enabled")
-    st.session_state["drive_enabled"] = bool(drive_enabled)
+    st.toggle("Auto-upload MP4 + thumbnail", value=bool(os.getenv("DRIVE_UPLOAD_ENABLED")), key="drive_enabled")
 
     drive_folder_input = st.text_input(
         "Drive folder link or ID",
