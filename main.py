@@ -1929,7 +1929,7 @@ with st.sidebar:
         st.caption("Avatar IV engine is enabled for Talking Photos.")
         talking_photo_id_input = st.text_input(
             "Talking Photo ID (talking_photo_id)",
-            value="",
+            value="d53434113ef240969f03d1fd376176e0",
             placeholder="e.g. 920e0e2ea96e4fcf8d3cc9a7457840bf",
         )
         st.session_state["talking_photo_id_input"] = talking_photo_id_input.strip()
