@@ -2032,7 +2032,7 @@ with st.sidebar:
         except Exception:
             st.warning("Service account JSON couldn't be parsed.")
 
-    if drive_enabled:
+    if st.session_state.get("drive_enabled"):
         if not _drive_deps_ready():
             st.warning("Drive deps missing. Add `google-api-python-client` and `google-auth` to requirements.")
         st.caption("Make sure the Drive folder is shared with the service account email (Editor).")
