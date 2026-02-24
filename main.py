@@ -53,6 +53,15 @@ except Exception:
     types = None
 from datetime import datetime, timedelta
 
+try:
+    from google.oauth2 import service_account  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore
+    from googleapiclient.http import MediaFileUpload  # type: ignore
+except Exception:
+    service_account = None
+    build = None
+    MediaFileUpload = None
+
 
 # -------------------------------
 # Simple login/auth (via st.secrets)
@@ -158,6 +167,12 @@ HEYGEN_API_KEY_ENV = os.getenv("HEYGEN_API_KEY", "")
 HEYGEN_BASE_V2 = "https://api.heygen.com/v2"
 HEYGEN_STATUS_V1 = "https://api.heygen.com/v1/video_status.get"
 
+DEFAULT_DRIVE_FOLDER_LINK = os.getenv(
+    "DRIVE_FOLDER_LINK",
+    "https://drive.google.com/drive/folders/0AOmUeJjNfdC_Uk9PVA",
+)
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
 
 # -------------------------------
 # Utilities
@@ -192,6 +207,78 @@ def slugify(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     return re.sub(r"-+", "-", s).strip("-") or "output"
+
+def extract_drive_folder_id(url_or_id: str) -> str:
+    s = (url_or_id or "").strip()
+    if not s:
+        return ""
+
+    # Already looks like an ID
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", s):
+        return s
+
+    # Common patterns
+    m = re.search(r"/folders/([A-Za-z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    return ""
+
+def _drive_deps_ready() -> bool:
+    return bool(service_account and build and MediaFileUpload)
+
+@st.cache_resource(show_spinner=False)
+def get_drive_service_from_sa_json(sa_json_bytes: bytes):
+    if not _drive_deps_ready():
+        raise RuntimeError("Google Drive dependencies missing. Install google-api-python-client and google-auth.")
+    if not sa_json_bytes:
+        raise RuntimeError("Service account JSON is empty.")
+    info = json.loads(sa_json_bytes.decode("utf-8"))
+    creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def download_url_to_file(url: str, out_path: Path, *, timeout: int = 300) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+def upload_file_to_drive(
+    drive_service,
+    *,
+    local_path: Path,
+    parent_folder_id: str,
+    mime_type: str,
+    drive_filename: Optional[str] = None,
+) -> Dict[str, str]:
+    if not local_path.exists():
+        raise FileNotFoundError(f"File not found: {local_path}")
+    if not parent_folder_id:
+        raise ValueError("Missing Drive folder id.")
+
+    metadata: Dict[str, Any] = {"name": drive_filename or local_path.name, "parents": [parent_folder_id]}
+    media = MediaFileUpload(str(local_path), mimetype=mime_type, resumable=True)
+    created = (
+        drive_service.files()
+        .create(
+            body=metadata,
+            media_body=media,
+            fields="id,name,webViewLink,webContentLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "id": created.get("id") or "",
+        "name": created.get("name") or (drive_filename or local_path.name),
+        "webViewLink": created.get("webViewLink") or "",
+        "webContentLink": created.get("webContentLink") or "",
+    }
 
 
 def is_gpt5(model: str) -> bool:
@@ -1851,6 +1938,59 @@ with st.sidebar:
     st.session_state["google_cse_api_key"] = google_cse_api_key
     st.session_state["google_cse_cx"] = google_cse_cx
 
+    st.divider()
+    # --- Google Drive upload ---
+    st.subheader("Google Drive Upload")
+    drive_enabled = st.toggle("Auto-upload MP4 + thumbnail", value=bool(os.getenv("DRIVE_UPLOAD_ENABLED")), key="drive_enabled")
+    st.session_state["drive_enabled"] = bool(drive_enabled)
+
+    drive_folder_input = st.text_input(
+        "Drive folder link or ID",
+        value=os.getenv("DRIVE_FOLDER_ID") or DEFAULT_DRIVE_FOLDER_LINK,
+        key="drive_folder_input",
+        help="Paste the Drive folder URL or just the folder ID.",
+    )
+    drive_folder_id = extract_drive_folder_id(drive_folder_input)
+    st.session_state["drive_folder_id"] = drive_folder_id
+    if drive_folder_id:
+        st.caption(f"Folder ID: {drive_folder_id}")
+    else:
+        st.warning("Enter a valid Drive folder link/ID to enable uploads.")
+
+    drive_sa_path = st.text_input(
+        "Service account JSON path (optional)",
+        value=os.getenv("DRIVE_SA_JSON_PATH", ""),
+        key="drive_sa_json_path",
+        help="If running locally, you can point to an on-disk key file instead of uploading it each run.",
+    )
+    drive_sa_upload = st.file_uploader("Or upload service account JSON key", type=["json"], key="drive_sa_json_uploader")
+
+    sa_json_bytes: Optional[bytes] = None
+    if drive_sa_upload is not None:
+        sa_json_bytes = drive_sa_upload.getvalue()
+    elif drive_sa_path.strip():
+        try:
+            p = Path(drive_sa_path.strip()).expanduser()
+            if p.exists() and p.is_file():
+                sa_json_bytes = p.read_bytes()
+        except Exception:
+            sa_json_bytes = None
+
+    st.session_state["drive_sa_json_bytes"] = sa_json_bytes
+    if sa_json_bytes:
+        try:
+            info = json.loads(sa_json_bytes.decode("utf-8"))
+            email = (info.get("client_email") or "").strip()
+            if email:
+                st.caption(f"Service account: {email}")
+        except Exception:
+            st.warning("Service account JSON couldn't be parsed.")
+
+    if drive_enabled:
+        if not _drive_deps_ready():
+            st.warning("Drive deps missing. Add `google-api-python-client` and `google-auth` to requirements.")
+        st.caption("Make sure the Drive folder is shared with the service account email (Editor).")
+
 # Early key tip
 if not st.session_state.get("openai_api_key"):
     st.info("Add your OPENAI_API_KEY in the sidebar to begin.")
@@ -2267,7 +2407,43 @@ def render_video_section():
                 raise RuntimeError(f"No video_url found in final status: {json.dumps(final_status, indent=2)}")
 
             st.session_state["heygen_video_url"] = video_url
+            st.session_state["heygen_video_id"] = video_id
             st.toast("HeyGen video ready", icon="🎬")
+
+            # Optional: download MP4 and upload to Google Drive
+            if st.session_state.get("drive_enabled"):
+                already = st.session_state.get("drive_uploaded_video_id")
+                if already != video_id:
+                    folder_id = (st.session_state.get("drive_folder_id") or "").strip()
+                    sa_json_bytes = st.session_state.get("drive_sa_json_bytes")
+                    if not folder_id:
+                        st.warning("Drive upload is enabled, but Drive folder ID is missing.")
+                    elif not sa_json_bytes:
+                        st.warning("Drive upload is enabled, but service account JSON is missing.")
+                    elif not _drive_deps_ready():
+                        st.warning("Drive upload is enabled, but Drive dependencies are not installed.")
+                    else:
+                        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                        topic = st.session_state.get("last_topic", "") or "reel"
+                        base = f"{ts}-{slugify(topic)}"
+                        mp4_path = DEFAULT_OUTPUT_DIR / f"{base}-video.mp4"
+                        try:
+                            with st.spinner("Downloading MP4…"):
+                                download_url_to_file(video_url, mp4_path, timeout=600)
+                            with st.spinner("Uploading MP4 to Google Drive…"):
+                                svc = get_drive_service_from_sa_json(sa_json_bytes)
+                                info = upload_file_to_drive(
+                                    svc,
+                                    local_path=mp4_path,
+                                    parent_folder_id=folder_id,
+                                    mime_type="video/mp4",
+                                    drive_filename=mp4_path.name,
+                                )
+                            st.session_state["drive_uploaded_video_id"] = video_id
+                            st.session_state["drive_uploaded_video_info"] = info
+                            st.toast("Uploaded video to Drive", icon="✅")
+                        except Exception as e:
+                            st.error(f"Drive upload (video) failed: {e}")
 
         except Exception as e:
             st.error(f"HeyGen rendering failed: {e}")
@@ -2275,6 +2451,9 @@ def render_video_section():
     if st.session_state.get("heygen_video_url"):
         st.video(st.session_state["heygen_video_url"])
         st.link_button("Open video in new tab", st.session_state["heygen_video_url"], use_container_width=True)
+        info = st.session_state.get("drive_uploaded_video_info") or {}
+        if info.get("webViewLink"):
+            st.link_button("Open uploaded video in Drive", info["webViewLink"], use_container_width=True)
     else:
         st.caption("No HeyGen video yet. Render to preview.")
 
@@ -2537,12 +2716,58 @@ def render_thumbnail_section():
                         main_image_bytes=st.session_state.get("thumb_main_image_bytes"),
                     )
                 if final_bytes:
+                    # Save locally (and optionally upload to Drive) before rerun.
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    topic = st.session_state.get("last_topic", "") or "reel"
+                    base = f"{ts}-{slugify(topic)}"
+                    png_path = DEFAULT_OUTPUT_DIR / f"{base}-thumbnail.png"
+                    try:
+                        png_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(png_path, "wb") as f:
+                            f.write(final_bytes)
+                        st.session_state["last_thumbnail_path"] = str(png_path)
+                    except Exception as e:
+                        st.warning(f"Could not save thumbnail locally: {e}")
+
+                    if st.session_state.get("drive_enabled"):
+                        thumb_hash = sha256_bytes(final_bytes)
+                        already = st.session_state.get("drive_uploaded_thumbnail_hash")
+                        folder_id = (st.session_state.get("drive_folder_id") or "").strip()
+                        sa_json_bytes = st.session_state.get("drive_sa_json_bytes")
+                        if already == thumb_hash:
+                            pass
+                        elif not folder_id:
+                            st.warning("Drive upload is enabled, but Drive folder ID is missing.")
+                        elif not sa_json_bytes:
+                            st.warning("Drive upload is enabled, but service account JSON is missing.")
+                        elif not _drive_deps_ready():
+                            st.warning("Drive upload is enabled, but Drive dependencies are not installed.")
+                        else:
+                            try:
+                                with st.spinner("Uploading thumbnail to Google Drive…"):
+                                    svc = get_drive_service_from_sa_json(sa_json_bytes)
+                                    info = upload_file_to_drive(
+                                        svc,
+                                        local_path=png_path,
+                                        parent_folder_id=folder_id,
+                                        mime_type="image/png",
+                                        drive_filename=png_path.name,
+                                    )
+                                st.session_state["drive_uploaded_thumbnail_hash"] = thumb_hash
+                                st.session_state["drive_uploaded_thumbnail_info"] = info
+                                st.toast("Uploaded thumbnail to Drive", icon="✅")
+                            except Exception as e:
+                                st.error(f"Drive upload (thumbnail) failed: {e}")
+
                     st.session_state["thumb_pending_final"] = final_bytes
                     st.rerun()
 
     if st.session_state.get("thumb_final_thumbnail_bytes"):
         st.markdown("#### Final Thumbnail")
         st.image(st.session_state["thumb_final_thumbnail_bytes"], use_column_width=True)
+        info = st.session_state.get("drive_uploaded_thumbnail_info") or {}
+        if info.get("webViewLink"):
+            st.link_button("Open uploaded thumbnail in Drive", info["webViewLink"], use_container_width=True)
         st.download_button(
             "Download Thumbnail",
             data=st.session_state["thumb_final_thumbnail_bytes"],

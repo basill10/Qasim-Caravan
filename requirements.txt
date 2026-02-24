@@ -3,4 +3,5 @@ openai>=1.40.0
 requests>=2.31.0
 numpy>=1.26.0
 google-genai>=0.7.0
-
+google-api-python-client>=2.0.0
+google-auth>=2.0.0
