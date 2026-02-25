@@ -2375,23 +2375,22 @@ def render_script_editor_once():
     topic = st.session_state.get("last_topic", "") or ""
     facts_payload = st.session_state.get("last_facts_payload")
 
+    script_box.text_area(
+        "Generated script (original, with sources/links)",
+        value=script_with_links,
+        height=240,
+        key="generated_script_with_links_view",
+        disabled=True,
+    )
+
     current_script_text = script_box.text_area(
-        "Script (cleaned for voiceover)",
+        "Generated script (cleaned for voiceover)",
         value=script,
         height=320,
         key="generated_script_text",
     )
-    st.caption("Tip: Edit above before generating audio or downloading.")
+    st.caption("Tip: Edit the cleaned script above before generating audio or downloading.")
     download_buttons_area(current_script_text, script_with_links, topic, facts_payload)
-
-    with st.expander("Script with links (source version)", expanded=False):
-        st.text_area(
-            "Script with links",
-            value=script_with_links,
-            height=240,
-            key="generated_script_with_links_view",
-            disabled=True,
-        )
 
 
 def render_revision_controls():
