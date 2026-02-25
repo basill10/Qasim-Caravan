@@ -166,6 +166,9 @@ ELEVEN_API_KEY_ENV = os.getenv("ELEVENLABS_API_KEY", "")
 DEFAULT_ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "ZKtPxZZTlravOYReKIFJ")
 ELEVEN_BASE = "https://api.elevenlabs.io/v1"
 
+# --- Script cleanup (remove hyperlinks for voiceover) ---
+LINK_CLEAN_MODEL = os.getenv("LINK_CLEAN_MODEL", "gpt-5-mini")
+
 # --- HeyGen ---
 HEYGEN_API_KEY_ENV = os.getenv("HEYGEN_API_KEY", "")
 HEYGEN_BASE_V2 = "https://api.heygen.com/v2"
@@ -1609,6 +1612,65 @@ def urdu_scriptify_text(client: OpenAI, text: str) -> str:
     return out.strip() if out else text
 
 
+def _regex_strip_links(text: str) -> str:
+    if not text:
+        return text
+
+    # Markdown links: [text](url) -> text
+    out = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", text)
+
+    # Naked URLs
+    out = re.sub(r"https?://\S+", "", out)
+    out = re.sub(r"\bwww\.\S+", "", out)
+
+    # Common citation markers that become noisy in TTS
+    out = re.sub(r"\[(\d{1,3})\]", "", out)
+    out = re.sub(r"\(\s*source\s*:\s*[^)]+\)", "", out, flags=re.IGNORECASE)
+
+    # Drop trailing "References/Sources" sections if present
+    out = re.split(r"\n\s*(references|sources)\s*\n", out, maxsplit=1, flags=re.IGNORECASE)[0]
+
+    # Tidy whitespace left by removals
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def strip_source_links_gpt5_mini(client: OpenAI, script: str) -> str:
+    """
+    Remove URLs/hyperlinks/citation markers from a script while keeping wording the same.
+    Falls back to regex cleanup if the model call fails.
+    """
+    if not script.strip():
+        return script
+
+    sys_msg = (
+        "You are a careful script editor for voiceover. "
+        "Task: remove ALL URLs and hyperlinks from the script, including markdown links like [text](url), "
+        "naked URLs, and any trailing References/Sources section. Also remove citation markers like [1], [2], etc. "
+        "Do NOT rewrite the script. Keep wording, punctuation, paragraphing, and line breaks the same as much as possible. "
+        "Output ONLY the cleaned script text."
+    )
+    user_msg = f"SCRIPT:\n{script}"
+
+    for model in [LINK_CLEAN_MODEL, "gpt-5"]:
+        try:
+            resp = client.responses.create(
+                model=model,
+                input=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+                text={"format": {"type": "text"}, "verbosity": "low"},
+                reasoning={"effort": "low", "summary": "auto"},
+                store=False,
+            )
+            out = _extract_text_from_responses(resp)
+            if out and out.strip():
+                return out.strip()
+        except Exception:
+            continue
+
+    return _regex_strip_links(script)
+
+
 
 
 
@@ -2244,19 +2306,27 @@ def set_script_state(
     facts_payload: dict | None,
     style_samples: List[str] | None = None,
     source: str | None = None,
+    script_with_links: str | None = None,
+    script_clean: str | None = None,
 ):
+    script_with_links_final = script_with_links if script_with_links is not None else script
+    script_clean_final = script_clean if script_clean is not None else script
     st.session_state.update(
         {
             "has_script": True,
-            "last_script": script,
+            "last_script": script_clean_final,
+            "last_script_with_links": script_with_links_final,
             "last_topic": topic,
             "last_facts_payload": facts_payload,
-            "original_script": script,
-            "script_revision_history": [script],
+            "original_script": script_clean_final,
+            "original_script_clean": script_clean_final,
+            "original_script_with_links": script_with_links_final,
+            "script_revision_history": [script_clean_final],
             "script_revision_requests": [],
             "last_style_samples": (style_samples or [])[:6],
-            "generated_script_text": script,
-            "original_script_view": script,
+            "generated_script_text": script_clean_final,
+            "original_script_view": script_with_links_final,
+            "generated_script_with_links_view": script_with_links_final,
             "script_revision_request": "",
             "script_source": source or "generated",
             "tts_ready_text": "",
@@ -2265,11 +2335,19 @@ def set_script_state(
         }
     )
 
-def download_buttons_area(text: str, topic: str, facts_payload: dict | None):
+def download_buttons_area(text_clean: str, text_with_links: str, topic: str, facts_payload: dict | None):
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = f"{ts}-{slugify(topic)}"
-    txt_name = f"{base}.txt"
-    st.download_button("Download script (.txt)", text, file_name=txt_name, mime="text/plain")
+    txt_name_clean = f"{base}.txt"
+    txt_name_with_links = f"{base}-with-links.txt"
+    st.download_button("Download script (.txt)", text_clean, file_name=txt_name_clean, mime="text/plain")
+    if (text_with_links or "").strip() and (text_with_links.strip() != (text_clean or "").strip()):
+        st.download_button(
+            "Download script with links (.txt)",
+            text_with_links,
+            file_name=txt_name_with_links,
+            mime="text/plain",
+        )
 
     if facts_payload is not None:
         json_name = f"{base}-facts.json"
@@ -2293,17 +2371,27 @@ def render_script_editor_once():
         st.session_state["generated_script_text"] = st.session_state.pop("pending_script_text")
 
     script = st.session_state.get("last_script", "") or ""
+    script_with_links = st.session_state.get("last_script_with_links", "") or script
     topic = st.session_state.get("last_topic", "") or ""
     facts_payload = st.session_state.get("last_facts_payload")
 
     current_script_text = script_box.text_area(
-        "Generated script",
+        "Script (cleaned for voiceover)",
         value=script,
         height=320,
         key="generated_script_text",
     )
     st.caption("Tip: Edit above before generating audio or downloading.")
-    download_buttons_area(current_script_text, topic, facts_payload)
+    download_buttons_area(current_script_text, script_with_links, topic, facts_payload)
+
+    with st.expander("Script with links (source version)", expanded=False):
+        st.text_area(
+            "Script with links",
+            value=script_with_links,
+            height=240,
+            key="generated_script_with_links_view",
+            disabled=True,
+        )
 
 
 def render_revision_controls():
@@ -2321,12 +2409,15 @@ def render_revision_controls():
         st.session_state["script_revision_request"] = st.session_state.pop("pending_revision_request")
 
     current_script = st.session_state.get("generated_script_text") or st.session_state.get("last_script") or ""
-    original_script = st.session_state.get("original_script") or current_script
+    original_script_clean = (
+        st.session_state.get("original_script_clean") or st.session_state.get("original_script") or current_script
+    )
+    original_script_with_links = st.session_state.get("original_script_with_links") or original_script_clean
 
-    with st.expander("Original script (saved)", expanded=False):
+    with st.expander("Original script (saved, with links)", expanded=False):
         st.text_area(
             "Original script",
-            value=original_script,
+            value=original_script_with_links,
             height=240,
             key="original_script_view",
             disabled=True,
@@ -2365,7 +2456,7 @@ def render_revision_controls():
             recent_requests = st.session_state.get("script_revision_requests") or []
             style_samples = st.session_state.get("last_style_samples") or []
             messages = build_revision_messages(
-                original_script=original_script,
+                original_script=original_script_clean,
                 current_script=current_script,
                 request=revision_request.strip(),
                 style_samples=style_samples,
@@ -2377,7 +2468,7 @@ def render_revision_controls():
             st.error(f"Revision failed: {e}")
             return
 
-        history = st.session_state.get("script_revision_history") or [original_script]
+        history = st.session_state.get("script_revision_history") or [original_script_clean]
         history.append(revised)
         st.session_state["script_revision_history"] = history
         st.session_state["script_revision_requests"] = recent_requests + [revision_request.strip()]
@@ -2394,13 +2485,13 @@ def render_revision_controls():
         st.rerun()
 
     if reset_original:
-        if not original_script:
+        if not original_script_clean:
             st.warning("No original script saved yet.")
             return
 
-        st.session_state["last_script"] = original_script
-        st.session_state["pending_script_text"] = original_script
-        st.session_state["script_revision_history"] = [original_script]
+        st.session_state["last_script"] = original_script_clean
+        st.session_state["pending_script_text"] = original_script_clean
+        st.session_state["script_revision_history"] = [original_script_clean]
         st.session_state["script_revision_requests"] = []
         st.session_state["last_facts_payload"] = None
         st.session_state["pending_revision_request"] = ""
@@ -3366,7 +3457,18 @@ if clicked_generate:
                             for i, url in enumerate(bibliography, start=1):
                                 st.markdown(f"[{i}] {url}")
 
-        set_script_state(script=script, topic=topic, facts_payload=facts_payload, style_samples=retrieved, source="generated")
+        script_with_links = script
+        with st.spinner("Removing source links for voiceover (GPT-5 mini)…"):
+            script_clean = strip_source_links_gpt5_mini(client, script_with_links)
+        set_script_state(
+            script=script_clean,
+            script_clean=script_clean,
+            script_with_links=script_with_links,
+            topic=topic,
+            facts_payload=facts_payload,
+            style_samples=retrieved,
+            source="generated",
+        )
         st.rerun()
 
 # -------------------------------
@@ -3481,8 +3583,13 @@ if st.session_state.get("last_news_items") is not None and len(st.session_state.
                             st.error(f"Generation failed: {e}")
                             st.stop()
 
+                    script_with_links = script
+                    with st.spinner("Removing source links for voiceover (GPT-5 mini)…"):
+                        script_clean = strip_source_links_gpt5_mini(client, script_with_links)
                     set_script_state(
-                        script=script,
+                        script=script_clean,
+                        script_clean=script_clean,
+                        script_with_links=script_with_links,
                         topic=topic_from_news,
                         facts_payload=None,
                         style_samples=retrieved,
