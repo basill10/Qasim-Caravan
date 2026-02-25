@@ -13,6 +13,7 @@ Environment (can also be entered in the sidebar at runtime):
     - OPENAI_API_KEY
     - TAVILY_API_KEY   (optional; required only if Fact Checking is enabled)
     - ELEVENLABS_API_KEY (for voiceover)
+    - ELEVENLABS_VOICE_ID (optional; default voice id for ElevenLabs)
     - HEYGEN_API_KEY     (for HeyGen assets + video)
 
 Auth:
@@ -162,6 +163,7 @@ GEMINI_API_KEY_ENV = os.getenv("GEMINI_API_KEY")
 
 # --- ElevenLabs ---
 ELEVEN_API_KEY_ENV = os.getenv("ELEVENLABS_API_KEY", "")
+DEFAULT_ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "ZKtPxZZTlravOYReKIFJ")
 ELEVEN_BASE = "https://api.elevenlabs.io/v1"
 
 # --- HeyGen ---
@@ -2016,6 +2018,8 @@ with st.sidebar:
     eleven_api_key = st.text_input("ELEVENLABS_API_KEY", value=ELEVEN_API_KEY_ENV, type="password")
     st.session_state["eleven_api_key"] = eleven_api_key
 
+    voice_id_fallback = (st.text_input("ELEVENLABS_VOICE_ID", value=DEFAULT_ELEVEN_VOICE_ID, key="eleven_voice_id_input") or "").strip()
+
     stability = 0.5
     similarity_boost = 0.75
     style = 0.0
@@ -2023,11 +2027,14 @@ with st.sidebar:
 
     voices = eleven_list_voices(eleven_api_key) if eleven_api_key else []
     voice_names = [f"{v['name']}  ·  {v.get('category') or ''}".strip() for v in voices] if voices else []
+    default_voice_idx = (
+        next((i for i, v in enumerate(voices) if v.get("id") == voice_id_fallback), 0) if voices else None
+    )
     voice_idx = st.selectbox(
         "Voice",
         list(range(len(voice_names))) if voice_names else [],
         format_func=lambda i: voice_names[i],
-        index=0 if voice_names else None,
+        index=default_voice_idx if voice_names else None,
         placeholder="Login key first to load voices…",
         disabled=not voices,
     )
@@ -2038,7 +2045,10 @@ with st.sidebar:
         style = st.slider("Style", 0.0, 1.0, style, 0.05)
         use_speaker_boost = st.toggle("Use Speaker Boost", value=use_speaker_boost)
 
-    st.session_state["eleven_voice_id"] = voices[voice_idx]["id"] if voices and voice_idx is not None else None
+    if voices and voice_idx is not None:
+        st.session_state["eleven_voice_id"] = voices[voice_idx]["id"]
+    else:
+        st.session_state["eleven_voice_id"] = voice_id_fallback or None
     st.session_state["eleven_settings"] = {
         "stability": stability if voices else None,
         "similarity_boost": similarity_boost if voices else None,
